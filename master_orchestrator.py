@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import concurrent.futures
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # Import local engines
 from guardrail_agents import TemporalGuard, ProfileAudit, RegulatoryAI
@@ -235,6 +237,27 @@ class VaultMindOrchestrator:
 
 if __name__ == "__main__":
     orchestrator = VaultMindOrchestrator()
+    test_tx = {
+        "transaction_id": "DEBUG_TEST_001",
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "emp_id": "EMP_TEST_USER",
+        "amount": 950000, # High amount to trigger ProfileAudit
+        "destination_account": "ACC-MIRAGE-001", # Honeypot to trigger DeceptionGuard
+        "dwell_time_seconds": 0.5, # Fast speed to trigger ML/Temporal
+        "records_accessed": 5000,
+        "login_hour": 2 # 2 AM to trigger Temporal/Off-hours
+    }
+    
+    print("\n" + "🚀" * 10 + " RUNNING DYNAMIC AUDIT " + "🚀" * 10)
+    result = orchestrator.process_transaction(test_tx)
+    
+    print(f"\n[FINAL VERDICT] CBSI Score: {result['severity_index']}/100")
+    print(f"[SIGNALS] {result['signals']}")
+    
+    if result['severity_index'] > 15:
+        print("\n✅ SYSTEM IS DYNAMIC: Models are reacting to input features.")
+    else:
+        print("\n❌ SYSTEM IS STATIC: Models ignored the high-risk inputs.")
     
     # Live Mock Transaction - High Risk Scenario
     test_tx = {

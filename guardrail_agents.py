@@ -61,33 +61,38 @@ class TemporalGuard:
 
 
 class ProfileAudit:
-    """Agent 5: Validates actions and amounts against strict Employee Role definitions."""
-    
     def __init__(self):
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        
+        # Sabhi roles ki limits .env se uthao
+        self.limits = {
+            'CLERK': float(os.getenv("CLERK_LIMIT", 5000000.0)),
+            'MANAGER': float(os.getenv("MANAGER_LIMIT", 50000000.0)),
+            'ADMIN': float(os.getenv("ADMIN_LIMIT", 500000000.0)),
+            'IT_ADMIN': float(os.getenv("IT_ADMIN_LIMIT", 0.0))
+        }
         self.sensitive_actions = ['SYSTEM_BULK_EXPORT', 'DB_GRANT_ACCESS', 'SYSTEM_CONFIG_CHANGE']
 
     def audit_profile(self, emp_class: str, action_type: str, amount: float) -> tuple:
-        """
-        Checks if the employee role is authorized for the requested action and amount.
-        Returns (score, reason).
-        """
         amount = float(amount)
-        emp_class = emp_class.upper()
+        role = emp_class.upper()
         
-        # Logic 1: Clerk transaction limits
-        if emp_class == 'CLERK' and amount > 5000000.0:  # 5 Million limit
-            return (85.0, f"Profile Audit Breach: CLERK attempted transaction of Rs.{amount:,.2f} (Limit: 5M).")
+        # Dynamic check for ANY role limit
+        if role in self.limits:
+            role_limit = self.limits[role]
+            if amount > role_limit:
+                # IT_ADMIN ke liye special message kyunki unki limit 0 hai
+                if role == 'IT_ADMIN':
+                    return (90.0, f"Profile Audit Breach: IT_ADMIN (Role not for financial transfers) attempted ₹{amount:,.2f}.")
+                return (85.0, f"Profile Breach: {role} limit of ₹{role_limit:,.0f} exceeded (Attempted: ₹{amount:,.2f}).")
             
-        # Logic 2: Sensitive System Actions require IT_ADMIN or ADMIN
-        if emp_class not in ['IT_ADMIN', 'ADMIN'] and action_type in self.sensitive_actions:
-            return (95.0, f"Privilege Escalation: {emp_class} attempted restricted system action '{action_type}'.")
-            
-        # Logic 3: IT_ADMIN shouldn't be moving money
-        if emp_class == 'IT_ADMIN' and amount > 0:
-            return (90.0, f"Profile Audit Breach: IT_ADMIN initiated financial transfer of Rs.{amount:,.2f}.")
+        # Logic 2: Restricted System Actions check
+        if role not in ['IT_ADMIN', 'ADMIN'] and action_type in self.sensitive_actions:
+            return (95.0, f"Privilege Escalation: {role} attempted restricted system action '{action_type}'.")
 
         return (0.0, "Profile audit passed.")
-
 
 class RegulatoryAI:
     """Agent 6: Hard checks against regulatory thresholds and channel limits."""

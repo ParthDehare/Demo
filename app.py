@@ -525,11 +525,19 @@ elif page == "Employee Roster":
     st.markdown(f'<div style="font-size:28px; font-weight:700; color:{T["text"]}; margin-bottom:12px;">Employee Roster</div>', unsafe_allow_html=True)
 
     try:
-        if not emp_df.empty and not scored_df.empty:
-            emp_scores = scored_df.groupby("emp_id")["cbsi_score"].agg(["max","mean","count"]).reset_index()
-            emp_scores.columns = ["emp_id", "max_score", "avg_score", "txn_count"]
-            emp_scores["avg_score"] = emp_scores["avg_score"].round(1)
-            roster = emp_df.merge(emp_scores, on="emp_id", how="left").fillna({"max_score":0,"avg_score":0,"txn_count":0})
+        if not emp_df.empty:
+            emp_scores = scored_df.groupby("emp_id")["cbsi_score"].agg(["max","mean","count"]).reset_index() if not scored_df.empty else pd.DataFrame()
+            
+            if not emp_scores.empty:
+                emp_scores.columns = ["emp_id", "max_score", "avg_score", "txn_count"]
+                emp_scores["avg_score"] = emp_scores["avg_score"].round(1)
+                roster = emp_df.merge(emp_scores, on="emp_id", how="left").fillna({"max_score":0,"avg_score":0,"txn_count":0})
+            else:
+                roster = emp_df.copy()
+                roster["max_score"] = 0
+                roster["avg_score"] = 0
+                roster["txn_count"] = 0
+            
             roster["max_score"] = roster["max_score"].astype(int)
             roster["txn_count"] = roster["txn_count"].astype(int)
             roster["status"] = roster["max_score"].apply(risk_tier)
@@ -537,13 +545,13 @@ elif page == "Employee Roster":
 
             f1, f2, f3 = st.columns(3)
             with f1:
-                role_filter = st.multiselect("Filter by Role", roster["emp_class"].unique().tolist(), default=roster["emp_class"].unique().tolist())
+                role_filter = st.multiselect("Filter by Role", sorted(roster["emp_class"].dropna().unique().tolist()), default=sorted(roster["emp_class"].dropna().unique().tolist()))
             with f2:
                 tier_filter = st.multiselect("Filter by Status", ["CRITICAL","HIGH","WATCH","NORMAL"], default=["CRITICAL","HIGH","WATCH","NORMAL"])
             with f3:
                 search = st.text_input("Search EMP_ID", "", placeholder="e.g. EMP_1234")
 
-            filtered = roster[roster["emp_class"].isin(role_filter) & roster["status"].isin(tier_filter)]
+            filtered = roster[(roster["emp_class"].isin(role_filter)) & (roster["status"].isin(tier_filter))]
             if search.strip():
                 filtered = filtered[filtered["emp_id"].str.contains(search.strip(), case=False, na=False)]
 
@@ -552,23 +560,26 @@ elif page == "Employee Roster":
             with pg2:
                 current_page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
             start_idx = (current_page - 1) * ROWS_PER_PAGE
-            page_data = filtered.iloc[start_idx:start_idx + ROWS_PER_PAGE]
+            page_data = filtered.iloc[start_idx:start_idx + ROWS_PER_PAGE].copy()
 
             st.markdown(f'<div style="color:{T["text2"]}; font-size:12px; margin-bottom:8px;">Showing {start_idx+1}-{min(start_idx+ROWS_PER_PAGE, len(filtered))} of {len(filtered)} employees | Page {current_page}/{total_pages}</div>', unsafe_allow_html=True)
 
             display_cols = ["emp_id", "emp_class", "branch_id", "max_score", "avg_score", "txn_count", "status"]
+            display_data = page_data[display_cols].rename(columns={
+                "emp_id":"Employee ID", "emp_class":"Role", "branch_id":"Branch",
+                "max_score":"Peak CBSI", "avg_score":"Avg CBSI",
+                "txn_count":"Transactions", "status":"Status"
+            })
             st.dataframe(
-                page_data[display_cols].rename(columns={
-                    "emp_id":"Employee ID", "emp_class":"Role", "branch_id":"Branch",
-                    "max_score":"Peak CBSI", "avg_score":"Avg CBSI",
-                    "txn_count":"Transactions", "status":"Status"
-                }),
-                width="stretch", hide_index=True, height=600
+                display_data,
+                width="stretch", hide_index=True, height=600, use_container_width=True
             )
         else:
-            st.warning("Employee or transaction data not available.")
+            st.warning("Employee data not available.")
     except Exception as e:
         st.error(f"Roster rendering error: {e}")
+        import traceback
+        st.error(traceback.format_exc())
 
 
 # ================================================================

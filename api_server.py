@@ -5,6 +5,8 @@ from typing import Optional
 import random
 from datetime import datetime
 from master_orchestrator import VaultMindOrchestrator
+import pandas as pd
+import os
 
 # Initialize FastAPI App
 app = FastAPI(title="VaultMind 2.0 Command Center API")
@@ -189,3 +191,37 @@ def orchestrator_scan(tx: TransactionRequest):
         "risk_level": "CRITICAL" if predicted_score >= 70 else "HIGH" if predicted_score >= 50 else "NORMAL",
         "signals_triggered": result.get('signals_triggered', [])
     }
+
+# ---------------------------------------------------------
+# ENDPOINT 8: Employee Roster with Metadata
+# ---------------------------------------------------------
+@app.get("/api/roster/employees")
+def get_employee_roster():
+    """
+    Returns employee metadata (emp_id, emp_class, branch_id, etc.)
+    Used by React frontend to display Employee Roster with Role and Branch columns
+    """
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        emp_csv = os.path.join(base_dir, "Testing_data", "employees_master.csv")
+        
+        if not os.path.exists(emp_csv):
+            return {"employees": [], "error": "Employee data not found"}
+        
+        emp_df = pd.read_csv(emp_csv)
+        
+        # Select relevant columns for frontend
+        cols_to_return = ["emp_id", "emp_class", "branch_id"]
+        cols_available = [c for c in cols_to_return if c in emp_df.columns]
+        
+        if not cols_available:
+            return {"employees": [], "error": "Required columns not found in employee data"}
+        
+        roster_data = emp_df[cols_available].drop_duplicates(subset=["emp_id"]).fillna("").to_dict('records')
+        return {
+            "employees": roster_data,
+            "total": len(roster_data),
+            "columns": cols_available
+        }
+    except Exception as e:
+        return {"employees": [], "error": str(e), "total": 0}

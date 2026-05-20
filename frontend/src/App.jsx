@@ -11,6 +11,7 @@ import {
 } from "recharts";
 import { ForensicTimeline, GlassBoxEngine, BlastRadius, ShapSimulator } from "./ProfileComponents.jsx";
 import { motion } from "framer-motion";
+import { getTriggeredRules, extractNlpFlags } from "./data";
 
 // ─── Theme Tokens ────────────────────────────────────────────
 const DARK = {
@@ -147,10 +148,11 @@ export default function App() {
   // API-Driven State
   const [scoredTxns, setScoredTxns] = useState([]);
   const [displayBuffer, setDisplayBuffer] = useState([]);
+  const [employeeMetadata, setEmployeeMetadata] = useState({});
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const MAX_TRANSACTIONS = 500;
-  const DISPLAY_BUFFER_MAX = 10;
+  const DISPLAY_BUFFER_MAX = 100;
 
   // Other UI States
   const [vaultEvidence, setVaultEvidence] = useState(() => {
@@ -276,6 +278,25 @@ export default function App() {
   // 1. Initial Load (Dashboard Foundation) - crash-safe
   useEffect(() => {
     setIsLoadingInitial(true);
+    
+    // Load employee metadata
+    fetch("http://localhost:8000/api/roster/employees")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.employees && Array.isArray(data.employees)) {
+          const metadataMap = {};
+          data.employees.forEach((emp) => {
+            metadataMap[emp.emp_id] = {
+              emp_class: emp.emp_class || "UNKNOWN",
+              branch_id: emp.branch_id || "UNKNOWN"
+            };
+          });
+          setEmployeeMetadata(metadataMap);
+        }
+      })
+      .catch((err) => console.warn("Employee metadata fetch failed (non-critical)", err));
+    
+    // Load transaction data
     fetch("http://localhost:8000/api/dashboard-init")
       .then((res) => res.json())
       .then((payload) => {
@@ -349,15 +370,18 @@ export default function App() {
 
     return employees.map((e) => {
       const s = map[e.emp_id] || { max: 0, sum: 0, count: 0 };
+      const meta = employeeMetadata[e.emp_id] || { emp_class: "UNKNOWN", branch_id: "UNKNOWN" };
       return {
         ...e,
+        emp_class: meta.emp_class,
+        branch_id: meta.branch_id,
         peak: s.max,
         avg: s.count ? Math.round((s.sum / s.count) * 10) / 10 : 0,
         txnCount: s.count,
         status: riskTier(s.max),
       };
     }).sort((a, b) => b.peak - a.peak);
-  }, [scoredTxns]);
+  }, [scoredTxns, employeeMetadata]);
 
   // ── KPI Stats (Dashboard uses DisplayBuffer) ───────────────
   const stats = useMemo(() => {

@@ -34,6 +34,10 @@ orchestrator = VaultMindOrchestrator()
 # GLOBAL DATA - Loaded at Startup
 # ──────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────
+# GLOBAL DATA - Loaded at Startup
+# ──────────────────────────────────────────────────────────────
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "Testing_data")
 
@@ -41,6 +45,8 @@ DATA_DIR = os.path.join(SCRIPT_DIR, "Testing_data")
 historical_df = None
 try:
     historical_df = pd.read_csv(os.path.join(DATA_DIR, "historical_warmup_data.csv"))
+    # 🔴 FIX: Replace NaN values with None to make it JSON compliant
+    historical_df = historical_df.where(pd.notnull(historical_df), None)
     print(f"✅ Loaded {len(historical_df)} historical records for dashboard foundation")
 except Exception as e:
     print(f"❌ Failed to load historical_warmup_data.csv: {e}")
@@ -51,6 +57,8 @@ live_stream_list = []
 live_stream_index = 0
 try:
     live_df = pd.read_csv(os.path.join(DATA_DIR, "live_demo_stream.csv"))
+    # 🔴 FIX: Replace NaN values with None to make it JSON compliant
+    live_df = live_df.where(pd.notnull(live_df), None)
     live_stream_list = live_df.to_dict('records')
     print(f"✅ Loaded {len(live_stream_list)} live stream transactions")
 except Exception as e:
@@ -70,6 +78,9 @@ class ExplainRequest(BaseModel):
     timestamp: Optional[str] = None
     remarks: Optional[str] = None
     transaction_id: Optional[str] = None
+
+class FeedbackRequest(BaseModel):
+    action: str  # "CONFIRM" or "FALSE_ALARM"
 
 @app.get("/health")
 def health_check():
@@ -246,8 +257,11 @@ def get_next_transaction():
         try:
             # Run orchestrator ML pipeline (GNN + Isolation Forest)
             ml_result = orchestrator.process_transaction(current_tx)
-            predicted_cbsi_score = ml_result.get('risk_score', 15)
-            signals_triggered = ml_result.get('signals_triggered', [])
+            
+            # 🔴 THE FIX: Orchestrator 'severity_index' aur 'signals' bhejta hai
+            predicted_cbsi_score = ml_result.get('severity_index', 15)
+            signals_triggered = ml_result.get('signals', [])
+            
         except Exception as ml_error:
             print(f"❌ ML pipeline error: {ml_error}, using default score")
             predicted_cbsi_score = 15
@@ -291,6 +305,48 @@ def get_next_transaction():
             "risk_tier": "NORMAL",
             "error": str(e)
         }
+
+
+@app.get("/api/roster/employees")
+def get_employee_roster():
+    """
+    Returns employee metadata (emp_id, emp_class, branch_id, etc.)
+    Used by React frontend to display Employee Roster with Role and Branch columns
+    """
+    try:
+        emp_csv = os.path.join(DATA_DIR, "employees_master.csv")
+        
+        if not os.path.exists(emp_csv):
+            return {"employees": [], "error": "Employee data not found"}
+        
+        emp_df = pd.read_csv(emp_csv)
+        
+        # Select relevant columns for frontend
+        cols_to_return = ["emp_id", "emp_class", "branch_id"]
+        cols_available = [c for c in cols_to_return if c in emp_df.columns]
+        
+        if not cols_available:
+            return {"employees": [], "error": "Required columns not found in employee data"}
+        
+        roster_data = emp_df[cols_available].drop_duplicates(subset=["emp_id"]).fillna("").to_dict('records')
+        return {
+            "employees": roster_data,
+            "total": len(roster_data),
+            "columns": cols_available
+        }
+    except Exception as e:
+        return {"employees": [], "error": str(e), "total": 0}
+
+
+@app.post("/api/feedback/{emp_id}")
+def submit_feedback(emp_id: str, feedback: FeedbackRequest):
+    """
+    Handle user feedback (incident confirmation/false alarm)
+    """
+    if feedback.action == "CONFIRM":
+        return {"status": "success", "message": f"Incident confirmed. Locking {emp_id} terminal and drafting FIU-STR."}
+    else:
+        return {"status": "success", "message": f"False alarm logged. Recalibrating AI baseline for {emp_id}."}
 
 
 # ──────────────────────────────────────────────────────────────

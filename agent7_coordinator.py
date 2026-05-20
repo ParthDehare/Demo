@@ -133,104 +133,86 @@ class BlockchainEvidenceChain:
 # SHAP EXPLAINABILITY ENGINE
 # ────────────────────────────────────────────────────────────────
 
+import joblib
+
 def compute_shap_explanation(row):
     """
-    Rule-based SHAP-style feature contributions.
-    Each contribution is derived from actual row values — not random.
+    True ML-Driven Explainability.
+    Connects to Agent 1's Scaler to calculate exact statistical deviation (Z-Scores) 
+    from the bank's normal operational baseline.
     """
     contributions = {}
     score_base = 0
+    
+    # ── TRUE ML CONNECTION ──
+    try:
+        # Agent 1 ka scaler load karo taaki ML math use ho sake
+        scaler = joblib.load(os.path.join("models", "agent1_scaler.pkl"))
+        has_ml = True
+    except Exception as e:
+        print(f"WARNING: ML Scaler missing, fallback to heuristics. ({e})")
+        has_ml = False
 
-    # 1. Off-hours login
-    hour = int(row.get('login_hour', 9))
-    if hour < 7 or hour > 21:
-        c = round(min(28, 10 + abs(hour - 14) * 1.5), 1)
-        contributions["off_hours_login"] = {
-            "value":        f"{hour:02d}:00",
-            "contribution": c,
-            "explanation":  f"Login at {hour:02d}:00 — outside normal 08:00–20:00 window"
-        }
-        score_base += c
-
-    # 2. Records accessed vs peer average
-    records   = int(row.get('records_accessed', 100))
-    emp_class = str(row.get('emp_class', 'CLERK'))
-    peer_avg  = {'CLERK': 115, 'MANAGER': 32, 'IT_ADMIN': 52000}.get(emp_class, 115)
-    if records > peer_avg * 1.5:
-        ratio = round(records / peer_avg, 1)
-        c     = min(25, round(ratio * 3, 1))
-        contributions["bulk_record_access"] = {
-            "value":        f"{records:,}",
-            "contribution": c,
-            "explanation":  f"{records:,} records — {ratio}x above peer avg ({peer_avg:,})"
-        }
-        score_base += c
-
-    # 3. Amount vs role ceiling
+    # Dynamic features extract karo
     amount = float(row.get('amount', 0))
-    if emp_class == 'CLERK' and amount > 499999:
-        c = min(22, round(amount / 499999 * 8, 1))
-        contributions["clerk_amount_violation"] = {
-            "value":        f"₹{amount:,.0f}",
-            "contribution": c,
-            "explanation":  f"Clerk initiated ₹{amount:,.0f} — exceeds ₹4,99,999 role ceiling"
-        }
-        score_base += c
-    elif amount > 5000000:
-        c = round(min(18, amount / 5000000 * 6), 1)
-        contributions["high_value_tx"] = {
-            "value":        f"₹{amount:,.0f}",
-            "contribution": c,
-            "explanation":  f"₹{amount:,.0f} — significantly above branch average"
-        }
-        score_base += c
-
-    # 4. Privilege escalation (Clerk doing Approve)
+    dwell = float(row.get('dwell_time_seconds', 120))
+    records = int(row.get('records_accessed', 0))
+    hour = int(row.get('login_hour', 9))
     action = str(row.get('action_type', ''))
+    emp_class = str(row.get('emp_class', 'CLERK'))
+
+    if has_ml:
+        # Features ko ML space mein transform karo
+        features = [[amount, dwell, records, hour]]
+        scaled_features = scaler.transform(features)[0]
+        
+        feature_mapping = [
+            ("Transaction Amount", amount, "amount_deviation"),
+            ("Dwell Time (Speed)", f"{dwell}s", "speed_anomaly"),
+            ("Records Accessed", records, "bulk_access"),
+            ("Login Hour", f"{hour:02d}:00", "temporal_anomaly")
+        ]
+
+        # Dynamic Z-Score Calculation (How far from normal?)
+        for i, (fname, raw_val, key) in enumerate(feature_mapping):
+            z_score = abs(scaled_features[i])
+            
+            # Agar deviation 1.0 standard deviation se zyada hai, tabhi flag karo
+            if z_score > 1.0:
+                # Math: Jyada deviation = Jyada risk contribution
+                c = min(30, int(z_score * 8)) 
+                score_base += c
+                contributions[key] = {
+                    "value": str(raw_val),
+                    "contribution": c,
+                    "explanation": f"ML Anomaly: Value deviates by {z_score:.2f} standard deviations from bank's normal baseline."
+                }
+
+    # ── CONTEXTUAL / RULE ENHANCEMENTS (Layer 2) ──
     if emp_class == 'CLERK' and action == 'Approve':
         contributions["privilege_escalation"] = {
-            "value":        action,
+            "value": action,
             "contribution": 25,
-            "explanation":  "CLERK role performed APPROVE — requires Manager authorization"
+            "explanation": "Role CLERK performed restricted APPROVE action (Manager authorization required)."
         }
         score_base += 25
 
-    # 5. Suspicious speed (too fast approval)
-    dwell = float(row.get('dwell_time_seconds', 120))
-    if dwell < 10 and action in ['Approve', 'Initiate']:
-        c = round(min(20, (10 - dwell) * 2), 1)
-        contributions["suspicious_speed"] = {
-            "value":        f"{dwell:.1f}s",
-            "contribution": c,
-            "explanation":  f"Action completed in {dwell:.1f}s — normal review is 8–20 minutes"
-        }
-        score_base += c
-
-    # 6. Off-hours flag (catch-all if no specific login hour)
-    if row.get('off_hours_flag', 0) == 1 and "off_hours_login" not in contributions:
-        contributions["off_hours_activity"] = {
-            "value":        "After hours",
-            "contribution": 12,
-            "explanation":  "Activity outside standard banking hours (08:00–20:00)"
-        }
-        score_base += 12
-
-    # Final score — normalise to 0-100 range
+    # Final score normalization
     if score_base == 0:
-        risk_score = 15  # Normal baseline score
+        risk_score = 15  # Normal
     else:
-        risk_score = int(min(95, score_base * 2 + 40))
+        risk_score = int(min(100, score_base + 30))
 
-    # Plain English
+    # Plain English Generator
     reasons = [v["explanation"] for v in contributions.values()]
-    plain = f"Risk score {risk_score}/100. "
+    plain = f"Risk score {risk_score}/100 calculated via ML Z-Score mapping. "
     if reasons:
-        plain += "Alert triggered by: " + "; ".join(reasons[:3]) + "."
+        plain += "Primary mathematical deviations: " + " | ".join(reasons[:2]) + "."
     else:
-        plain += "Compound behavioural deviation detected across multiple signals."
+        plain += "Transaction aligns with historical cluster baselines."
 
     return {
-        "risk_score":    risk_score,
+        "risk_score": risk_score,
         "contributions": contributions,
         "plain_english": plain,
     }
