@@ -1,0 +1,28 @@
+{
+  "str_reference": "STR-20260520091917-EMP1003",
+  "filing_date": "2026-05-20T09:19:17.668425",
+  "reporting_entity": "Union Bank of India",
+  "rbi_circular": "RBI/2024-25/16",
+  "bsa_2023_section": "Bharatiya Sakshya Adhiniyam 2023 \u2014 Section 63",
+  "pmla_section": "Section 12",
+  "subject_employee_id": "EMP_1003",
+  "subject_emp_class": "CLERK",
+  "subject_branch": "BR_01",
+  "transaction_id": "TXN_20260520091917_EMP1003",
+  "transaction_timestamp": "2026-05-20T03:49:17",
+  "transaction_amount": 5000000.0,
+  "action_type": "SYSTEM_BULK_EXPORT",
+  "risk_score": 95,
+  "fraud_confirmed": true,
+  "detection_reasons": [
+    "Login at 03:00 \u2014 outside normal 08:00\u201320:00 window",
+    "52,000 records \u2014 452.2x above peer avg (115)",
+    "Clerk initiated \u20b95,000,000 \u2014 exceeds \u20b94,99,999 role ceiling"
+  ],
+  "blockchain_block_id": 1,
+  "data_hash_sha256": "3172dbab7ccd62b691242d6e6aef4888986ebe4e89ee98590fe8af66169b4739",
+  "block_hash_sha256": "a07c1a6dad1ec5bc9c461c9e7a85ed922f4a842b1973c40e81d12e98557ea58b",
+  "evidence_package_id": "EVD-20260520091917",
+  "status": "FILED",
+  "next_action": "FCU review within 24h. Escalate Tier-2 if score > 80."
+}
