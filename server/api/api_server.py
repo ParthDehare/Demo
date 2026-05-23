@@ -126,6 +126,40 @@ def generate_explanation(emp_id: str, payload: Optional[ExplainRequest] = None):
     return {"explanation": explanation}
 
 # ---------------------------------------------------------
+# ENDPOINT NEW: Dashboard Init — loads historical warmup data
+# ---------------------------------------------------------
+@router.get("/dashboard-init")
+def get_dashboard_init():
+    """
+    Returns last 500 rows of historical warmup data for initial dashboard population.
+    """
+    try:
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        csv_path = os.path.join(base_dir, "data", "Testing_data", "historical_warmup_data.csv")
+        if not os.path.exists(csv_path):
+            return []
+        df = pd.read_csv(csv_path)
+        # Only load columns needed by frontend
+        cols = ["transaction_id", "emp_id", "emp_class", "branch_id",
+                "action_type", "amount", "account_touched", "transfer_channel",
+                "timestamp", "is_fraud_flag", "raw_complaint_text"]
+        cols_available = [c for c in cols if c in df.columns]
+        df = df[cols_available].tail(500)
+        # Add cbsi_score column (0 for historical — will be scored by orchestrator in real run)
+        df["cbsi_score"] = 0
+        df["cbsi"] = 0
+        df["risk_tier"] = "NORMAL"
+        # Replace NaN with None so JSON serializes cleanly
+        import math
+        def clean(v):
+            if isinstance(v, float) and math.isnan(v): return None
+            return v
+        records = [{k: clean(v) for k, v in row.items()} for row in df.to_dict('records')]
+        return records
+    except Exception as e:
+        return []
+
+# ---------------------------------------------------------
 # ENDPOINT 5: Human-in-the-Loop Feedback
 # ---------------------------------------------------------
 @router.post("/feedback/{emp_id}")
@@ -174,8 +208,9 @@ def get_employee_roster():
     Used by React frontend to display Employee Roster with Role and Branch columns
     """
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        emp_csv = os.path.join(base_dir, "Testing_data", "employees_master.csv")
+        # Go up from server/api/ -> server/ -> server/data/Testing_data/
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        emp_csv = os.path.join(base_dir, "data", "Testing_data", "employees_master.csv")
         
         if not os.path.exists(emp_csv):
             return {"employees": [], "error": "Employee data not found"}

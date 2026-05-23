@@ -2,58 +2,122 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import { X, AlertTriangle, Clock, Shield, Zap, Radio, Search } from "lucide-react";
 
-// ── Dynamic Graph Data Generator (From Real Stream) ──────────────
+// ── Dynamic Graph Data Generator (Clustered & Aggregated) ────────
 const processGraphData = (liveTxns, targetEmp) => {
-  const nodesMap = new Map();
+  const empNodes = new Map();   // emp_id -> node data
+  const accNodes = new Map();   // account_touched -> node data (only high-value/fraud accs)
+  const empToEmp = new Map();   // "empA->empB" -> { weight, isFraud }
+  const empToAcc = new Map();   // "empA->ACC_X" -> { weight, isFraud, amount }
   const links = [];
 
-  // Limit to last 200 transactions to keep graph fast and clean
-  const recentTxns = Array.isArray(liveTxns) ? liveTxns.slice(-200) : [];
+  // Only use last 300 transactions
+  const recentTxns = Array.isArray(liveTxns) ? liveTxns.slice(-300) : [];
 
+  // First pass: build employee stats
+  const empStats = {};
   recentTxns.forEach((tx) => {
-    if (!tx.emp_id || !tx.account_touched) return;
+    const eid = tx.emp_id;
+    if (!eid) return;
+    if (!empStats[eid]) empStats[eid] = { maxCbsi: 0, totalAmount: 0, count: 0, isFraud: false };
+    empStats[eid].maxCbsi = Math.max(empStats[eid].maxCbsi, tx.cbsi || 0);
+    empStats[eid].totalAmount += tx.amount || 0;
+    empStats[eid].count++;
+    if (tx.is_fraud_flag === 1 || tx.cbsi >= 80) empStats[eid].isFraud = true;
+  });
 
-    const isAttacker = tx.emp_id === targetEmp;
-    const isHoneypot = tx.account_touched.includes("GHOST");
-    const isFraud = tx.is_fraud_flag === 1 || tx.cbsi >= 80;
+  // Second pass: build nodes and edges
+  recentTxns.forEach((tx) => {
+    if (!tx.emp_id) return;
 
-    // 1. Add Employee Node
-    if (!nodesMap.has(tx.emp_id)) {
-      nodesMap.set(tx.emp_id, {
-        id: tx.emp_id,
-        type: isAttacker ? "attacker" : "employee",
-        val: isAttacker ? 8 : (isFraud ? 5 : 3),
+    const eid = tx.emp_id;
+    const acc = tx.account_touched;
+    const isAttacker = eid === targetEmp;
+    const isFraudTx = tx.is_fraud_flag === 1 || (tx.cbsi || 0) >= 70;
+    const isHoneypot = acc && (acc.includes("GHOST") || acc.includes("MIRAGE"));
+    const empStat = empStats[eid] || {};
+
+    // Add employee node
+    if (!empNodes.has(eid)) {
+      empNodes.set(eid, {
+        id: eid,
+        type: isAttacker ? "attacker" : (empStat.isFraud ? "fraud_emp" : "employee"),
+        val: isAttacker ? 10 : (empStat.isFraud ? 6 : 3),
+        cbsi: empStat.maxCbsi,
+        txCount: empStat.count,
       });
     } else if (isAttacker) {
-      nodesMap.get(tx.emp_id).type = "attacker";
-      nodesMap.get(tx.emp_id).val = 8;
+      empNodes.get(eid).type = "attacker";
+      empNodes.get(eid).val = 10;
     }
 
-    // 2. Add Account Node
-    if (!nodesMap.has(tx.account_touched)) {
-      nodesMap.set(tx.account_touched, {
-        id: tx.account_touched,
-        type: isHoneypot ? "honeypot" : "account",
-        val: isHoneypot ? 6 : 2,
-      });
+    if (!acc) return;
+
+    // For honeypot/fraud accounts — cluster them into centralized hubs
+    if (isHoneypot || isFraudTx) {
+      const clusterId = isHoneypot ? "HONEYPOT_NETWORK" : "EXTERNAL_FRAUD_RING";
+      
+      if (!accNodes.has(clusterId)) {
+        accNodes.set(clusterId, {
+          id: clusterId,
+          type: isHoneypot ? "honeypot" : "fraud_acc",
+          val: isHoneypot ? 15 : 12,
+        });
+      }
+      // Edge: employee -> cluster hub
+      const key = `${eid}=>${clusterId}`;
+      if (!empToAcc.has(key)) {
+        empToAcc.set(key, { source: eid, target: clusterId, isFraud: true, amount: tx.amount || 0, count: 1 });
+      } else {
+        const e = empToAcc.get(key);
+        e.amount += tx.amount || 0;
+        e.count++;
+      }
     }
 
-    // 3. Add Edge (Transaction)
+    // For Approve transactions — show as employee->approval queue edge (collusion detection)
+    if (tx.action_type === "Approve" && isFraudTx) {
+      const key = `${eid}=>APPROVAL_QUEUE`;
+      if (!empToAcc.has(key)) {
+        if (!accNodes.has("APPROVAL_QUEUE")) {
+          accNodes.set("APPROVAL_QUEUE", { id: "APPROVAL_QUEUE", type: "account", val: 8 });
+        }
+        empToAcc.set(key, { source: eid, target: "APPROVAL_QUEUE", isFraud: true, amount: tx.amount || 0, count: 1 });
+      } else {
+        const e = empToAcc.get(key);
+        e.amount += tx.amount || 0;
+        e.count++;
+      }
+    }
+  });
+
+  // Build final links from empToAcc map
+  empToAcc.forEach((edge, key) => {
     links.push({
-      id: tx.transaction_id || `link_${tx.emp_id}_${tx.account_touched}_${Math.random()}`,
-      source: tx.emp_id,
-      target: tx.account_touched,
-      type: isFraud ? "breach" : (isAttacker ? "attacker_std" : "standard"),
-      amount: tx.amount,
-      cbsi: tx.cbsi
+      id: key,
+      source: edge.source,
+      target: edge.target,
+      type: edge.isFraud ? "breach" : "standard",
+      amount: edge.amount,
+      count: edge.count,
     });
   });
 
-  return { 
-    nodes: Array.from(nodesMap.values()), 
-    links: links 
+  // Only include account nodes that have edges
+  const linkedAccIds = new Set(links.map(l => l.target));
+  const filteredAccNodes = Array.from(accNodes.values()).filter(n => linkedAccIds.has(n.id));
+
+  // Only include employee nodes that have at least one fraud link OR are high risk
+  const linkedEmpIds = new Set(links.map(l => l.source));
+  const allEmpNodes = Array.from(empNodes.values()).filter(n =>
+    linkedEmpIds.has(n.id) || n.type === "attacker" || (empStats[n.id]?.maxCbsi >= 70)
+  );
+
+  return {
+    nodes: [...allEmpNodes, ...filteredAccNodes],
+    links,
   };
 };
+
 
 // ── Timeline & Styles (Kept as is) ───────────────────────────────
 const TIMELINE = [
@@ -156,6 +220,8 @@ function drawNode(node, ctx, globalScale, hoveredId, targetEmp) {
 
   const isAttacker  = node.type === "attacker";
   const isHoneypot  = node.type === "honeypot";
+  const isFraudEmp  = node.type === "fraud_emp";
+  const isFraudAcc  = node.type === "fraud_acc";
   const isEmployee  = node.type === "employee";
   const isHovered   = node.id === hoveredId;
   const r           = node.val * 2;
@@ -166,19 +232,39 @@ function drawNode(node, ctx, globalScale, hoveredId, targetEmp) {
     const grd = ctx.createRadialGradient(node.x, node.y, 0, node.x, node.y, r * 3.5);
     grd.addColorStop(0, "rgba(220,38,38,0.35)"); grd.addColorStop(1, "rgba(220,38,38,0)");
     ctx.beginPath(); ctx.arc(node.x, node.y, r * 3.5, 0, 2 * Math.PI); ctx.fillStyle = grd; ctx.fill();
-    
     ctx.beginPath(); ctx.arc(node.x, node.y, r, 0, 2 * Math.PI); ctx.fillStyle = isHovered ? "#ff4444" : "#dc2626"; ctx.fill();
-    ctx.beginPath(); ctx.arc(node.x, node.y, r + 2.5, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(220,38,38,0.6)"; ctx.stroke();
-    
+    ctx.beginPath(); ctx.arc(node.x, node.y, r + 2.5, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(220,38,38,0.6)"; ctx.lineWidth = 1.5; ctx.stroke();
     ctx.font = `bold ${Math.max(4, 8 / globalScale)}px monospace`; ctx.fillStyle = "#fff"; ctx.textAlign = "center";
     ctx.fillText(node.id, node.x, node.y + r + 8 / globalScale);
   } else if (isHoneypot) {
     ctx.beginPath(); ctx.save(); ctx.translate(node.x, node.y); ctx.rotate(Math.PI / 4);
     ctx.fillStyle = isHovered ? "#fde047" : "#eab308"; const s = r * 0.85; ctx.fillRect(-s, -s, s * 2, s * 2); ctx.restore();
-    ctx.beginPath(); ctx.arc(node.x, node.y, r + 2, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(234,179,8,0.55)"; ctx.stroke();
+    ctx.beginPath(); ctx.arc(node.x, node.y, r + 2, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(234,179,8,0.55)"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.font = `${Math.max(3, 7 / globalScale)}px monospace`; ctx.fillStyle = "#eab308"; ctx.textAlign = "center";
+    ctx.fillText(node.id, node.x, node.y + r + 7 / globalScale);
+  } else if (isFraudEmp) {
+    // High-risk employee — orange pulsing ring
+    const grd = ctx.createRadialGradient(node.x, node.y, 0, node.x, node.y, r * 2.5);
+    grd.addColorStop(0, "rgba(251,146,60,0.25)"); grd.addColorStop(1, "rgba(251,146,60,0)");
+    ctx.beginPath(); ctx.arc(node.x, node.y, r * 2.5, 0, 2 * Math.PI); ctx.fillStyle = grd; ctx.fill();
+    ctx.beginPath(); ctx.arc(node.x, node.y, r, 0, 2 * Math.PI); ctx.fillStyle = isHovered ? "#fb923c" : "rgba(251,146,60,0.85)"; ctx.fill();
+    ctx.beginPath(); ctx.arc(node.x, node.y, r + 2, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(251,146,60,0.5)"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.font = `${Math.max(3, 6 / globalScale)}px monospace`; ctx.fillStyle = "#fb923c"; ctx.textAlign = "center";
+    ctx.fillText(node.id, node.x, node.y + r + 6 / globalScale);
+  } else if (isFraudAcc) {
+    // Fraud account — red square
+    ctx.save(); ctx.translate(node.x, node.y);
+    const s = r * 0.9;
+    ctx.fillStyle = isHovered ? "rgba(239,68,68,0.9)" : "rgba(239,68,68,0.6)";
+    ctx.fillRect(-s, -s, s * 2, s * 2);
+    ctx.strokeStyle = "rgba(239,68,68,0.4)"; ctx.lineWidth = 1;
+    ctx.strokeRect(-s - 2, -s - 2, s * 2 + 4, s * 2 + 4);
+    ctx.restore();
+    ctx.font = `${Math.max(3, 5 / globalScale)}px monospace`; ctx.fillStyle = "rgba(239,68,68,0.8)"; ctx.textAlign = "center";
+    ctx.fillText(node.id, node.x, node.y + r + 6 / globalScale);
   } else {
     ctx.beginPath(); ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
-    ctx.fillStyle = isEmployee ? (isHovered ? "rgba(0,212,170,0.9)" : "rgba(0,212,170,0.6)") : (isHovered ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.4)");
+    ctx.fillStyle = isEmployee ? (isHovered ? "rgba(0,212,170,0.9)" : "rgba(0,212,170,0.5)") : (isHovered ? "rgba(255,255,255,0.8)" : "rgba(255,255,255,0.3)");
     ctx.fill();
   }
 
@@ -224,9 +310,9 @@ export default function FundFlowGraph({ liveTxns, onGenerateEvidence }) {
 
   useEffect(() => {
     if (!graphRef.current) return;
-    graphRef.current.d3Force("link").distance(() => 60);
-    graphRef.current.d3Force("charge").strength(-120);
-  }, []);
+    graphRef.current.d3Force("link").distance((link) => link.type === "breach" ? 180 : 250);
+    graphRef.current.d3Force("charge").strength(-600);
+  }, [graphData]);
 
   return (
     <div className="relative w-screen h-screen overflow-hidden" style={{ background: "#0a0a0a" }}>
@@ -242,7 +328,10 @@ export default function FundFlowGraph({ liveTxns, onGenerateEvidence }) {
         onLinkClick={(l) => { if (l.type === "breach") setPanel(l); }}
         onNodeHover={(n) => setHovered(n?.id ?? null)}
         onLinkHover={(l) => setHovLink(l?.id ?? null)}
-        enableNodeDrag enableZoomInteraction cooldownTicks={120}
+        enableNodeDrag enableZoomInteraction
+        d3AlphaDecay={0.05}
+        d3VelocityDecay={0.4}
+        cooldownTicks={150}
       />
 
       {/* HUD — Top Left */}
@@ -252,7 +341,7 @@ export default function FundFlowGraph({ liveTxns, onGenerateEvidence }) {
           <span className="text-[10px] font-mono text-emerald-400 tracking-widest uppercase">Live Network Intel</span>
         </div>
         <p className="text-[10px] font-mono text-slate-600 mb-4">
-          {graphData.nodes.length} nodes · {graphData.links.length} edges · Auto-sync active
+          {graphData.nodes.length} nodes · {graphData.links.length} fraud edges · Auto-sync active
         </p>
         
         {/* Search Bar */}

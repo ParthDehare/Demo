@@ -149,18 +149,21 @@ export default function App() {
 
   // API-Driven State
   const [scoredTxns, setScoredTxns] = useState([]);
-  const [displayBuffer, setDisplayBuffer] = useState([]);
   const [employeeMetadata, setEmployeeMetadata] = useState({});
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const MAX_TRANSACTIONS = 500;
-  const DISPLAY_BUFFER_MAX = 100;
+  const MAX_TRANSACTIONS = 10000;
+  // ERR7: Evidence vault pagination + new-row tracking
+  const [evidencePage, setEvidencePage] = useState(1);
+  const [newEvidenceIds, setNewEvidenceIds] = useState(new Set());
+  const EVIDENCE_PER_PAGE = 20;
 
   // ✨ Supabase Data State (Dummy Removed) ✨
   const [vaultEvidence, setVaultEvidence] = useState([]);
 
   // Other UI States
   const [confirmedIncidents, setConfirmedIncidents] = useState([]);
+  const [falseAlarms, setFalseAlarms] = useState([]);
   const [generateTarget, setGenerateTarget] = useState("");
   const [isGeneratingDossier, setIsGeneratingDossier] = useState(false);
   const [lastGenerated, setLastGenerated] = useState(null);
@@ -174,18 +177,32 @@ export default function App() {
     });
   }, []);
 
-  // ✨ NEW: SUPABASE LIVE FETCH EFFECT ✨
+  const handleFalseAlarm = useCallback((emp_id) => {
+    const normalized = (emp_id || "").toUpperCase();
+    if (!normalized) return;
+    
+    // Call the backend feedback API
+    fetch(`http://localhost:8000/api/feedback/${normalized}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "FALSE_ALARM", feedback_text: "Model retraining initiated by analyst" })
+    }).catch(err => console.error("Failed to submit feedback", err));
+
+    setFalseAlarms((prev) => {
+      if (prev.includes(normalized)) return prev;
+      return [...prev, normalized];
+    });
+  }, []);
+
+  // ✨ SUPABASE LIVE FETCH EFFECT ✨
   useEffect(() => {
-    // 1. Initial Load
     const fetchEvidence = async () => {
       try {
         const { data, error } = await supabase
           .from('evidence_logs')
           .select('*')
           .order('created_at', { ascending: false });
-
         if (error) throw error;
-
         if (data) {
           const formattedData = data.map(log => ({
             id: log.id || `EVD-${Math.random()}`,
@@ -203,14 +220,10 @@ export default function App() {
         console.error("Failed to fetch from Supabase:", err);
       }
     };
-
     fetchEvidence();
-
-    // 2. Real-Time Subscription
     const subscription = supabase
       .channel('evidence_logs_changes')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'evidence_logs' }, payload => {
-        console.log("🔥 New fraud log from DB:", payload);
         const log = payload.new;
         const newEvd = {
           id: log.id || `EVD-${Math.random()}`,
@@ -222,13 +235,14 @@ export default function App() {
           status: "Generated",
           risk: log.risk_level
         };
+        // ERR7: Flash new rows green
+        setNewEvidenceIds(prev => new Set([...prev, newEvd.id]));
+        setTimeout(() => setNewEvidenceIds(prev => { const n = new Set(prev); n.delete(newEvd.id); return n; }), 3000);
         setVaultEvidence(prev => [newEvd, ...prev]);
+        setEvidencePage(1); // jump to first page on new evidence
       })
       .subscribe();
-
-    return () => {
-      supabase.removeChannel(subscription);
-    };
+    return () => { supabase.removeChannel(subscription); };
   }, []);
 
 
@@ -327,10 +341,9 @@ export default function App() {
   const t = theme === "dark" ? DARK : LIGHT;
   const tc = TIER_COLORS(t);
 
-  // 1. Initial Load (Dashboard Foundation) - crash-safe
+  // 1. Initial Load — employee metadata + historical transactions
   useEffect(() => {
     setIsLoadingInitial(true);
-    
     // Load employee metadata
     fetch("http://localhost:8000/api/roster/employees")
       .then((res) => res.json())
@@ -338,106 +351,81 @@ export default function App() {
         if (data.employees && Array.isArray(data.employees)) {
           const metadataMap = {};
           data.employees.forEach((emp) => {
-            metadataMap[emp.emp_id] = {
-              emp_class: emp.emp_class || "UNKNOWN",
-              branch_id: emp.branch_id || "UNKNOWN"
-            };
+            metadataMap[emp.emp_id] = { emp_class: emp.emp_class || "UNKNOWN", branch_id: emp.branch_id || "UNKNOWN" };
           });
           setEmployeeMetadata(metadataMap);
         }
       })
-      .catch((err) => console.warn("Employee metadata fetch failed (non-critical)", err));
-    
-    // Load transaction data
+      .catch((err) => console.warn("Employee metadata fetch failed", err));
+    // Load historical transaction data
     fetch("http://localhost:8000/api/dashboard-init")
       .then((res) => res.json())
       .then((payload) => {
-        const rows = Array.isArray(payload)
-          ? payload
-          : Array.isArray(payload?.data)
-            ? payload.data
-            : [];
+        const rows = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
         const normalized = rows.map((tx) => ({
           ...tx,
-          cbsi: tx.cbsi ?? tx.predicted_cbsi_score ?? tx.cbsi_score ?? 0,
-          risk_tier: tx.risk_tier ?? riskTier(tx.cbsi ?? tx.predicted_cbsi_score ?? tx.cbsi_score ?? 0)
+          cbsi: tx.cbsi ?? tx.cbsi_score ?? tx.predicted_cbsi_score ?? 0,
+          risk_tier: tx.risk_tier ?? riskTier(tx.cbsi ?? tx.cbsi_score ?? tx.predicted_cbsi_score ?? 0)
         }));
         setScoredTxns(normalized);
-        setDisplayBuffer(normalized.slice(-DISPLAY_BUFFER_MAX));
       })
       .catch((err) => console.error("Initial load failed", err))
       .finally(() => setIsLoadingInitial(false));
   }, []);
 
-  // 2. Live Stream (Delta Update) - crash-safe via WebSocket
+  // WebSocket: normalize with emp_id/emp_class/branch_id fallbacks from transaction itself
+  const normalizeTransaction = useCallback((newTxn) => {
+    if (!newTxn || !newTxn.emp_id) return null;
+    const normalized = {
+      ...newTxn,
+      cbsi: newTxn.cbsi ?? newTxn.cbsi_score ?? newTxn.predicted_cbsi_score ?? 0,
+      risk_tier: newTxn.risk_tier ?? riskTier(newTxn.cbsi ?? newTxn.cbsi_score ?? newTxn.predicted_cbsi_score ?? 0)
+    };
+    // ERR4: update employeeMetadata inline from transaction fields
+    if (newTxn.emp_class || newTxn.branch_id) {
+      setEmployeeMetadata(prev => ({
+        ...prev,
+        [newTxn.emp_id]: {
+          emp_class: newTxn.emp_class || prev[newTxn.emp_id]?.emp_class || "UNKNOWN",
+          branch_id: newTxn.branch_id || prev[newTxn.emp_id]?.branch_id || "UNKNOWN"
+        }
+      }));
+    }
+    return normalized;
+  }, []);
+
   const fetchNextTransaction = useCallback(() => {
     return fetch("http://localhost:8000/get-next-transaction")
       .then((res) => res.json())
       .then((newTxn) => {
-        if (newTxn && newTxn.emp_id) {
-          const normalized = {
-            ...newTxn,
-            cbsi: newTxn.cbsi ?? newTxn.predicted_cbsi_score ?? newTxn.cbsi_score ?? 0,
-            risk_tier: newTxn.risk_tier ?? riskTier(newTxn.cbsi ?? newTxn.predicted_cbsi_score ?? newTxn.cbsi_score ?? 0)
-          };
-          setScoredTxns((prev) => {
-            const safePrev = Array.isArray(prev) ? prev : [];
-            return [...safePrev, normalized].slice(-MAX_TRANSACTIONS);
-          });
-          setDisplayBuffer((prev) => {
-            const safePrev = Array.isArray(prev) ? prev : [];
-            return [...safePrev, normalized].slice(-DISPLAY_BUFFER_MAX);
-          });
+        const normalized = normalizeTransaction(newTxn);
+        if (normalized) {
+          setScoredTxns((prev) => [...(Array.isArray(prev) ? prev : []), normalized].slice(-MAX_TRANSACTIONS));
         }
       })
       .catch((err) => console.error("Live update failed", err));
-  }, []);
+  }, [normalizeTransaction]);
 
-  // Listen to WebSocket for live stream instead of polling
+  // WebSocket live stream
   useEffect(() => {
     if (!autoRefresh) return;
-    
     const ws = new WebSocket("ws://localhost:8000/ws/alerts");
-    
-    ws.onopen = () => {
-      console.log("🟢 Connected to WebSocket for live alerts");
-    };
-
+    ws.onopen = () => console.log("🟢 Connected to WebSocket for live alerts");
     ws.onmessage = (event) => {
       try {
         const newTxn = JSON.parse(event.data);
-        if (newTxn && newTxn.emp_id) {
-          const normalized = {
-            ...newTxn,
-            cbsi: newTxn.cbsi ?? newTxn.predicted_cbsi_score ?? newTxn.cbsi_score ?? 0,
-            risk_tier: newTxn.risk_tier ?? riskTier(newTxn.cbsi ?? newTxn.predicted_cbsi_score ?? newTxn.cbsi_score ?? 0)
-          };
-          setScoredTxns((prev) => {
-            const safePrev = Array.isArray(prev) ? prev : [];
-            return [...safePrev, normalized].slice(-MAX_TRANSACTIONS);
-          });
-          setDisplayBuffer((prev) => {
-            const safePrev = Array.isArray(prev) ? prev : [];
-            return [...safePrev, normalized].slice(-DISPLAY_BUFFER_MAX);
-          });
+        const normalized = normalizeTransaction(newTxn);
+        if (normalized) {
+          setScoredTxns((prev) => [...(Array.isArray(prev) ? prev : []), normalized].slice(-MAX_TRANSACTIONS));
         }
       } catch (err) {
         console.error("Error processing WebSocket message", err);
       }
     };
-
-    ws.onerror = (err) => {
-      console.error("WebSocket error:", err);
-    };
-
-    ws.onclose = () => {
-      console.log("🔴 WebSocket disconnected");
-    };
-
-    return () => {
-      ws.close();
-    };
-  }, [autoRefresh]);
+    ws.onerror = (err) => console.error("WebSocket error:", err);
+    ws.onclose = () => console.log("🔴 WebSocket disconnected");
+    return () => ws.close();
+  }, [autoRefresh, normalizeTransaction]);
 
   // ── Employee scores (API-Driven) ────────────────────────────────
   const empScores = useMemo(() => {
@@ -458,29 +446,36 @@ export default function App() {
     ).map(emp_id => ({ emp_id }));
 
     return employees.map((e) => {
+      const isFalseAlarm = falseAlarms.includes(e.emp_id);
       const s = map[e.emp_id] || { max: 0, sum: 0, count: 0 };
       const meta = employeeMetadata[e.emp_id] || { emp_class: "UNKNOWN", branch_id: "UNKNOWN" };
+      
+      // Override peak and tier if marked as false alarm
+      const peakScore = isFalseAlarm ? 0 : s.max;
+
       return {
         ...e,
         emp_class: meta.emp_class,
         branch_id: meta.branch_id,
-        peak: s.max,
+        peak: peakScore,
         avg: s.count ? Math.round((s.sum / s.count) * 10) / 10 : 0,
         txnCount: s.count,
-        status: riskTier(s.max),
+        status: riskTier(peakScore),
       };
     }).sort((a, b) => b.peak - a.peak);
-  }, [scoredTxns, employeeMetadata]);
+  }, [scoredTxns, employeeMetadata, falseAlarms]);
 
-  // ── KPI Stats (Dashboard uses DisplayBuffer) ───────────────
+  // ERR1: stats use scoredTxns (not capped displayBuffer)
+  // ERR2: high threshold aligned with riskTier() (>=50 && <70)
+  // ERR3: confirmed fraud uses confirmedIncidents.length (not is_fraud_flag)
   const stats = useMemo(() => {
-    const total = displayBuffer.length;
-    const critical = displayBuffer.filter((x) => x.cbsi >= 70).length;
-    const high = displayBuffer.filter((x) => x.cbsi >= 40 && x.cbsi < 70).length;
-    const fraud = displayBuffer.filter((x) => x.is_fraud_flag === 1).length;
-    const avg = total ? Math.round((displayBuffer.reduce((s, x) => s + x.cbsi, 0) / total) * 10) / 10 : 0;
+    const total = scoredTxns.length;
+    const critical = scoredTxns.filter((x) => (x.cbsi || 0) >= 70).length;
+    const high = scoredTxns.filter((x) => (x.cbsi || 0) >= 50 && (x.cbsi || 0) < 70).length;
+    const fraud = confirmedIncidents.length;
+    const avg = total ? Math.round((scoredTxns.reduce((s, x) => s + (x.cbsi || 0), 0) / total) * 10) / 10 : 0;
     return { total, critical, high, fraud, avg };
-  }, [displayBuffer]);
+  }, [scoredTxns, confirmedIncidents]);
 
   // ── Nav Items ──────────────────────────────────────────────
   const NAV = [
@@ -556,7 +551,7 @@ export default function App() {
           </button>
 
           <div className="text-[10px] text-center" style={{ color: t.text2 }}>
-            Display Buffer: {displayBuffer.length} / {DISPLAY_BUFFER_MAX}
+            Transactions: {scoredTxns.length.toLocaleString()}
           </div>
         </div>
       </aside>
@@ -597,7 +592,7 @@ export default function App() {
                   <LoadingShimmer t={t} />
                 ) : (() => {
                   try {
-                    const safeBuffer = Array.isArray(displayBuffer) ? displayBuffer : [];
+                    const safeBuffer = Array.isArray(scoredTxns) ? scoredTxns : [];
                     if (!safeBuffer.length) {
                       return <div className="text-sm" style={{ color: t.text2 }}>Loading Live Stream...</div>;
                     }
@@ -638,7 +633,7 @@ export default function App() {
                   <LoadingShimmer t={t} />
                 ) : (() => {
                   try {
-                    const safeBuffer = Array.isArray(displayBuffer) ? displayBuffer : [];
+                    const safeBuffer = Array.isArray(scoredTxns) ? scoredTxns : [];
                     if (!safeBuffer.length) {
                       return <div className="text-sm" style={{ color: t.text2 }}>Loading Live Stream...</div>;
                     }
@@ -771,7 +766,7 @@ export default function App() {
                   ) : (() => {
                     try {
                       const counts = { CRITICAL: 0, HIGH: 0, WATCH: 0, NORMAL: 0 };
-                      displayBuffer.forEach((tx) => { counts[riskTier(tx.cbsi)]++; });
+                      scoredTxns.slice(-500).forEach((tx) => { counts[riskTier(tx.cbsi || 0)]++; });
                       const data = Object.entries(counts).map(([k, v]) => ({ name: k, value: v }));
                       const colors = [t.red, t.amber, t.cyan, t.green];
                       return (
@@ -959,6 +954,7 @@ export default function App() {
 
                 const flaggedTxns = txns.filter((x) => x.cbsi >= 40).sort((a, b) => b.cbsi - a.cbsi).slice(0, 20);
                 const nlpTxns = txns.filter((tx) => tx?.raw_complaint_text?.trim());
+                const isFalseAlarm = falseAlarms.includes(eid);
 
                 return (
                   <>
@@ -976,17 +972,18 @@ export default function App() {
                       <div className="mt-4 flex items-center gap-3">
                         <button
                           onClick={() => handleConfirmIncident(eid)}
-                          disabled={isConfirmed}
+                          disabled={isConfirmed || isFalseAlarm}
                           className="px-3 py-1.5 text-[10px] font-mono font-bold border border-[#E50914] text-[#E50914] hover:bg-[#E50914] hover:text-white transition-colors uppercase rounded-sm cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           [ CONFIRM INCIDENT ]
                         </button>
-                         <button
-                           onClick={() => showToast("False Positive", "Model retraining initiated...", "amber")}
-                           className="px-3 py-1.5 text-[10px] font-mono font-bold border border-[#FFB300] text-[#FFB300] hover:bg-[#FFB300] hover:text-black transition-colors uppercase rounded-sm cursor-pointer"
-                         >
-                           [ FALSE ALARM / RETRAIN ]
-                         </button>
+                                 <button
+                                   onClick={() => handleFalseAlarm(eid)}
+                                   disabled={isFalseAlarm || isConfirmed}
+                                   className="px-3 py-1.5 text-[10px] font-mono font-bold border border-[#FFB300] text-[#FFB300] hover:bg-[#FFB300] hover:text-black transition-colors uppercase rounded-sm cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                                 >
+                                   {isFalseAlarm ? "[ RETRAINING AI... ]" : "[ FALSE ALARM / RETRAIN ]"}
+                                 </button>
                         {isConfirmed && (
                           <span className="text-[10px] font-mono font-bold text-[#00E676] uppercase tracking-widest">
                             INCIDENT CONFIRMED
@@ -1015,6 +1012,124 @@ export default function App() {
           </div>
         )}
 
+        {/* ── EVIDENCE VAULT ──────────────────────────────── */}
+        {page === "evidence" && (() => {
+          const totalPages = Math.max(1, Math.ceil(vaultEvidence.length / EVIDENCE_PER_PAGE));
+          const evPage = Math.min(evidencePage, totalPages);
+          const evSlice = vaultEvidence.slice((evPage - 1) * EVIDENCE_PER_PAGE, evPage * EVIDENCE_PER_PAGE);
+          return (
+            <div className="space-y-4">
+              <h1 className="text-2xl font-bold">Evidence Vault</h1>
+
+              <div className="grid grid-cols-2 gap-4">
+                <KpiCard title="PDF Evidence Packages" value={String(vaultEvidence.length)} color={t.teal} t={t} />
+                <KpiCard title="STR JSON Filings" value={String(vaultEvidence.length)} color={t.cyan} t={t} />
+              </div>
+
+              <Section title="Verified STR Evidence Packages (Agent 7)" t={t} />
+              <Card t={t} className="!p-0 overflow-hidden mb-2">
+                <table className="w-full text-left text-sm font-mono">
+                  <thead className="bg-[#111] text-gray-500 text-[10px] uppercase">
+                    <tr>
+                      <th className="p-4 border-b border-[#222]">Filename</th>
+                      <th className="p-4 border-b border-[#222]">SHA-256 Hash</th>
+                      <th className="p-4 border-b border-[#222]">Block ID</th>
+                      <th className="p-4 border-b border-[#222]">Timestamp</th>
+                      <th className="p-4 border-b border-[#222]">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#222]">
+                    {evSlice.map((evd) => (
+                      <tr
+                        key={evd.id}
+                        className="hover:bg-[#1a1a1a] transition-colors"
+                        style={newEvidenceIds.has(evd.id) ? { background: "rgba(0,230,118,0.08)" } : {}}
+                      >
+                        <td className="p-4 text-[#00D4AA] font-bold">
+                          <div className="flex items-center gap-2">
+                            {evd.status === "Generated" && <FileText size={14} className="text-[#00D4AA]" />}
+                            {newEvidenceIds.has(evd.id) && <span className="text-[9px] font-mono text-green-400 animate-pulse">NEW</span>}
+                            <span className={evd.status === "Generated" ? "" : "text-gray-500"}>{evd.filename}</span>
+                          </div>
+                        </td>
+                        <td className="p-4 text-xs text-gray-400">{evd.hash}</td>
+                        <td className="p-4 text-xs text-gray-400">{evd.blockId}</td>
+                        <td className="p-4 text-[10px] text-gray-500">{evd.timestamp}</td>
+                        <td className="p-4">
+                          {evd.status === "Pending Dossier" ? (
+                            <span className="text-xs text-[#FFB300] font-bold animate-pulse">PENDING DOSSIER</span>
+                          ) : (
+                            <button
+                              onClick={() => { setDownloading(evd.filename); setTimeout(() => setDownloading(null), 2000); }}
+                              className="flex items-center gap-2 px-3 py-1.5 rounded bg-[#E50914] text-white text-[10px] uppercase font-bold hover:bg-red-700 transition cursor-pointer"
+                              disabled={downloading === evd.filename}
+                            >
+                              {downloading === evd.filename ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                              Download
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Card>
+
+              <div className="flex justify-between items-center text-xs" style={{ color: t.text2 }}>
+                <span>Showing {(evPage - 1) * EVIDENCE_PER_PAGE + 1}–{Math.min(evPage * EVIDENCE_PER_PAGE, vaultEvidence.length)} of {vaultEvidence.length}</span>
+                <div className="flex items-center gap-3">
+                  <button onClick={() => setEvidencePage(Math.max(1, evPage - 1))} disabled={evPage <= 1}
+                    className="p-1.5 rounded border cursor-pointer disabled:opacity-30" style={{ borderColor: t.border, color: t.text2 }}>
+                    <ChevronLeft size={14} />
+                  </button>
+                  <span className="font-mono">Page {evPage} / {totalPages}</span>
+                  <button onClick={() => setEvidencePage(Math.min(totalPages, evPage + 1))} disabled={evPage >= totalPages}
+                    className="p-1.5 rounded border cursor-pointer disabled:opacity-30" style={{ borderColor: t.border, color: t.text2 }}>
+                    <ChevronRight size={14} />
+                  </button>
+                </div>
+              </div>
+
+              <Section title="Generate New Evidence" t={t} />
+              <Card t={t} className="flex items-center justify-between p-6">
+                <div className="text-sm" style={{ color: t.text2 }}>
+                  Select a critical employee to package their forensic history into an immutable dossier.
+                </div>
+                <div className="flex items-center gap-4">
+                  <select
+                    value={generateTarget}
+                    onChange={(e) => setGenerateTarget(e.target.value)}
+                    className="bg-[#111] border border-[#333] text-white px-4 py-2 rounded font-mono text-sm outline-none cursor-pointer"
+                  >
+                    <option value="">Select Target...</option>
+                    {dossierOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                  {isGeneratingDossier ? (
+                    <div className="px-6 py-2 flex items-center gap-2 bg-[#00D4AA] text-[#111] font-bold uppercase tracking-wider rounded">
+                      <Loader2 size={16} className="animate-spin" /> GENERATING...
+                    </div>
+                  ) : lastGenerated && lastGenerated.emp_id === generateTarget ? (
+                    <div className="px-4 py-2 flex items-center gap-2 rounded border border-[#333] bg-[#111] text-xs font-mono text-gray-300">
+                      <FileText size={14} className="text-[#00D4AA]" />
+                      {lastGenerated.hash}
+                    </div>
+                  ) : (
+                    <button
+                      onClick={handleGenerateDossier}
+                      disabled={!generateTarget}
+                      className="px-6 py-2 flex items-center gap-2 bg-[#00D4AA] text-[#111] font-bold uppercase tracking-wider rounded hover:bg-[#00b390] transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      [ GENERATE FIU DOSSIER ]
+                    </button>
+                  )}
+                </div>
+              </Card>
+            </div>
+          );
+        })()}
+
 {/* ── FUND FLOW GRAPH ─────────────────────────────── */}
         {page === "graph" && (
           <div className="-m-6 h-screen overflow-hidden">
@@ -1031,240 +1146,150 @@ export default function App() {
           </div>
         )}
 
-        {/* ── EVIDENCE VAULT ──────────────────────────────── */}
-        {page === "evidence" && (
-          <div className="space-y-4">
-            <h1 className="text-2xl font-bold">Evidence Vault</h1>
-
-            <div className="grid grid-cols-2 gap-4">
-              <KpiCard title="PDF Evidence Packages" value={String(vaultEvidence.length)} color={t.teal} t={t} />
-              <KpiCard title="STR JSON Filings" value={String(vaultEvidence.length)} color={t.cyan} t={t} />
-            </div>
-
-            <Section title="Verified STR Evidence Packages (Agent 7)" t={t} />
-            <Card t={t} className="!p-0 overflow-hidden mb-6">
-              <table className="w-full text-left text-sm font-mono">
-                <thead className="bg-[#111] text-gray-500 text-[10px] uppercase">
-                  <tr>
-                    <th className="p-4 border-b border-[#222]">Filename</th>
-                    <th className="p-4 border-b border-[#222]">SHA-256 Hash</th>
-                    <th className="p-4 border-b border-[#222]">Block ID</th>
-                    <th className="p-4 border-b border-[#222]">Timestamp</th>
-                    <th className="p-4 border-b border-[#222]">Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#222]">
-                  {vaultEvidence.map((evd) => {
-                    return (
-                      <tr key={evd.id} className="hover:bg-[#1a1a1a] transition-colors">
-                        <td className="p-4 text-[#00D4AA] font-bold">
-                          <div className="flex items-center gap-2">
-                            {evd.status === "Generated" && <FileText size={14} className="text-[#00D4AA]" />}
-                            <span className={evd.status === "Generated" ? "" : "text-gray-500"}>{evd.filename}</span>
-                          </div>
-                        </td>
-                        <td className="p-4 text-xs text-gray-400">{evd.hash}</td>
-                        <td className="p-4 text-xs text-gray-400">{evd.blockId}</td>
-                        <td className="p-4 text-[10px] text-gray-500">{evd.timestamp}</td>
-                        <td className="p-4">
-                          {evd.status === "Pending Dossier" ? (
-                            <span className="text-xs text-[#FFB300] font-bold animate-pulse">PENDING DOSSIER</span>
-                          ) : (
-                            <button
-                              onClick={() => {
-                                setDownloading(evd.filename);
-                                setTimeout(() => setDownloading(null), 2000);
-                              }}
-                              className="flex items-center gap-2 px-3 py-1.5 rounded bg-[#E50914] text-white text-[10px] uppercase font-bold hover:bg-red-700 transition cursor-pointer"
-                              disabled={downloading === evd.filename}
-                            >
-                              {downloading === evd.filename ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
-                              Download
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </Card>
-
-            <Section title="Generate New Evidence" t={t} />
-            <Card t={t} className="flex items-center justify-between p-6">
-              <div className="text-sm" style={{ color: t.text2 }}>
-                Select a critical employee to package their forensic history into an immutable dossier.
-              </div>
+        {/* ── DECEPTIONGUARD ─────────────────────────────────── */}
+        {page === "deception" && (() => {
+          // ERR5: Data-driven from live scoredTxns
+          const honeypotBreaches = scoredTxns.filter(tx =>
+            tx.account_touched && (tx.account_touched.includes("MIRAGE") || tx.account_touched.includes("GHOST")) ||
+            (tx.decision === "ISOLATE" && tx.dominant_agent === "DeceptionGuard")
+          );
+          const liveBreachTx = honeypotBreaches[honeypotBreaches.length - 1];
+          const staticHoneypotBreach = {
+            accountId: liveBreachTx?.account_touched || "ACC_GHOST_07",
+            attackerId: liveBreachTx?.emp_id || "EMP_1024",
+            attackerRole: liveBreachTx?.emp_class || "IT Admin",
+            threatOrigin: liveBreachTx ? `${liveBreachTx.emp_id} (${liveBreachTx.emp_class || 'Unknown'}) | Branch: ${liveBreachTx.branch_id || 'Unknown'}` : "EMP_1024 (IT Admin) | IP: 192.168.1.45 (Mumbai_BR_05)"
+          };
+          return (
+            <div className="space-y-6 pb-12">
               <div className="flex items-center gap-4">
-                <select 
-                  value={generateTarget} 
-                  onChange={(e) => setGenerateTarget(e.target.value)}
-                  className="bg-[#111] border border-[#333] text-white px-4 py-2 rounded font-mono text-sm outline-none cursor-pointer"
-                >
-                  <option value="">Select Target...</option>
-                  {dossierOptions.map((opt) => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                {isGeneratingDossier ? (
-                  <div className="px-6 py-2 flex items-center gap-2 bg-[#00D4AA] text-[#111] font-bold uppercase tracking-wider rounded">
-                    <Loader2 size={16} className="animate-spin" /> GENERATING...
-                  </div>
-                ) : lastGenerated && lastGenerated.emp_id === generateTarget ? (
-                  <div className="px-4 py-2 flex items-center gap-2 rounded border border-[#333] bg-[#111] text-xs font-mono text-gray-300">
-                    <FileText size={14} className="text-[#00D4AA]" />
-                    {lastGenerated.hash}
-                  </div>
-                ) : (
-                  <button 
-                    onClick={handleGenerateDossier}
-                    disabled={!generateTarget}
-                    className="px-6 py-2 flex items-center gap-2 bg-[#00D4AA] text-[#111] font-bold uppercase tracking-wider rounded hover:bg-[#00b390] transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    [ GENERATE FIU DOSSIER ]
-                  </button>
+                <h1 className="text-2xl font-bold font-mono tracking-[4px] uppercase" style={{ color: t.accent }}>DeceptionGuard</h1>
+                {honeypotBreaches.length > 0 && (
+                  <span className="px-2 py-0.5 rounded text-xs font-mono font-bold bg-red-500/20 text-red-400 animate-pulse">
+                    {honeypotBreaches.length} LIVE BREACH{honeypotBreaches.length > 1 ? 'ES' : ''} DETECTED
+                  </span>
                 )}
               </div>
-            </Card>
-          </div>
-        )}
 
-        {/* ── DECEPTIONGUARD ─────────────────────────────────── */}
-        {page === "deception" && (
-          <div className="space-y-6 pb-12">
-            <h1 className="text-2xl font-bold font-mono tracking-[4px] uppercase" style={{ color: t.accent }}>DeceptionGuard</h1>
-            
-            <div className="grid grid-cols-2 gap-6">
-              <div>
-                <Section title="Honeypot Node Radar" t={t} />
-                <Card t={t} className="flex flex-col items-center justify-center !py-12 relative overflow-hidden h-[400px]">
-                  <div className="absolute inset-0 opacity-10 pointer-events-none" 
-                    style={{ background: 'linear-gradient(rgba(0, 255, 0, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 255, 0, 0.1) 1px, transparent 1px)', backgroundSize: '20px 20px' }}></div>
-                  
-                  <div className="relative flex items-center justify-center w-64 h-64 border border-[#333] rounded-full">
-                    {/* Concentric circles */}
-                    <div className="absolute w-48 h-48 border border-[#333] rounded-full"></div>
-                    <div className="absolute w-32 h-32 border border-[#333] rounded-full"></div>
-                    <div className="absolute w-16 h-16 border border-[#333] rounded-full text-center flex items-center justify-center font-mono text-[8px] text-[#333]">CORE</div>
-                    
-                    {/* Clean Radar Arm */}
-                    <motion.div 
-                      animate={{ rotate: 360 }}
-                      transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
-                      className="absolute w-full h-full rounded-full"
-                      style={{ 
-                        background: "conic-gradient(from 0deg, rgba(0, 230, 118, 0.05) 0deg, transparent 60deg, transparent 360deg)",
-                        borderRight: "1px solid rgba(0, 230, 118, 0.4)"
-                      }}
-                    />
-                    
-                    {/* Clean Wireframe Pulsing Nodes */}
-                    <motion.div 
-                      animate={{ opacity: [0.1, 1, 0.1] }}
-                      transition={{ duration: 2, repeat: Infinity, delay: 0.2 }}
-                      className="absolute w-1.5 h-1.5 bg-[#00E676] rounded-full top-10 left-20 shadow-[0_0_8px_#00E676]"
-                    />
-                    <motion.div 
-                      animate={{ opacity: [0.1, 1, 0.1] }}
-                      transition={{ duration: 2.5, repeat: Infinity, delay: 1 }}
-                      className="absolute w-2 h-2 bg-[#FFB300] rounded-full top-12 right-16 shadow-[0_0_10px_#FFB300]"
-                    />
-                    <motion.div 
-                      animate={{ opacity: [0.1, 1, 0.1] }}
-                      transition={{ duration: 3, repeat: Infinity, delay: 0.5 }}
-                      className="absolute bottom-12 left-12 flex items-center gap-1.5"
-                    >
-                      <div className="w-2 h-2 bg-[#E50914] rounded-full shadow-[0_0_10px_#E50914]" />
-                      <span className="text-[8px] font-mono font-bold text-[#E50914] tracking-widest whitespace-nowrap opacity-80 mix-blend-screen">[TARGET PING: MUMBAI]</span>
-                    </motion.div>
-                    <motion.div 
-                      animate={{ opacity: [0.1, 1, 0.1] }}
-                      transition={{ duration: 1.5, repeat: Infinity, delay: 2 }}
-                      className="absolute w-1.5 h-1.5 bg-[#00E676] rounded-full bottom-20 right-12 shadow-[0_0_8px_#00E676]"
-                    />
-                  </div>
-                  <div className="mt-8 text-xs font-mono text-[#00E676] animate-pulse uppercase tracking-widest flex items-center gap-2">
-                    <span className="w-2 h-2 bg-[#00E676] rounded-sm"></span> Scanning Subnets...
-                  </div>
-                </Card>
-              </div>
-
-              <div>
-                <Section title="Active Ghost Accounts" t={t} />
-                <Card t={t} className="!p-0 overflow-hidden">
-                  <div className="h-[400px] flex flex-col">
-                    <table className="w-full text-left text-sm font-mono flex-shrink-0">
-                      <thead className="bg-[#111] text-gray-500 text-[10px] uppercase sticky top-0 z-10">
-                        <tr>
-                          <th className="p-4 border-b border-[#222] w-1/4">Account ID</th>
-                          <th className="p-4 border-b border-[#222] w-1/4">Honey Balance</th>
-                          <th className="p-4 border-b border-[#222] w-1/4">Status</th>
-                          <th className="p-4 border-b border-[#222] w-1/4">Threat Origin</th>
-                        </tr>
-                      </thead>
-                    </table>
-                    <div className="overflow-y-auto flex-1">
-                      <table className="w-full text-left text-sm font-mono">
-                        <tbody className="divide-y divide-[#222]">
-                      <tr className="hover:bg-[#1a1a1a] transition-colors">
-                        <td className="p-4 text-[#00B4D8] font-bold">ACC_GHOST_99</td>
-                        <td className="p-4">Rs.50,00,000</td>
-                        <td className="p-4 text-xs text-gray-400">Monitoring for lookup</td>
-                        <td className="p-4 text-[10px] text-gray-600">-</td>
-                      </tr>
-                      <tr className="hover:bg-[#1a1a1a] transition-colors">
-                        <td className="p-4 text-[#00B4D8] font-bold">ACC_GHOST_42</td>
-                        <td className="p-4">Rs.1,20,00,000</td>
-                        <td className="p-4 text-xs text-gray-400">Decoy credential deployed</td>
-                        <td className="p-4 text-[10px] text-gray-600">Awaiting trace...</td>
-                      </tr>
-                      <tr className="hover:bg-[#1a1a1a] transition-colors bg-[#2a1313]">
-                        <td className="p-4 text-[#E50914] font-bold">{honeypotBreach.accountId}</td>
-                        <td className="p-4">Rs.8,00,000</td>
-                        <td className="p-4 text-xs text-[#E50914] font-bold animate-pulse">
-                          BREACH DETECTED
-                          <button 
-                            onClick={() => { setProfileSearch(honeypotBreach.attackerId); setPage("profile"); }}
-                            className="ml-4 px-3 py-1 bg-[#E50914] text-white text-[10px] uppercase tracking-wider rounded font-bold hover:bg-red-700 transition cursor-pointer"
-                          >
-                            [ Investigate ]
-                          </button>
-                        </td>
-                        <td className="p-4 text-[11px] text-[#FFB300] font-bold tracking-tight">{honeypotBreach.threatOrigin}</td>
-                      </tr>
-                       <tr className="hover:bg-[#1a1a1a] transition-colors">
-                         <td className="p-4 text-[#00B4D8] font-bold">ACC_GHOST_15</td>
-                         <td className="p-4">Rs.25,00,000</td>
-                         <td className="p-4 text-xs text-gray-400">Await access trigger</td>
-                         <td className="p-4 text-[10px] text-gray-600">Dormant</td>
-                       </tr>
-                       <tr className="hover:bg-[#1a1a1a] transition-colors">
-                         <td className="p-4 text-[#00B4D8] font-bold">ACC_GHOST_61</td>
-                         <td className="p-4">Rs.75,00,000</td>
-                         <td className="p-4 text-xs text-gray-400">Credential logged</td>
-                         <td className="p-4 text-[10px] text-gray-600">Monitoring</td>
-                       </tr>
-                       <tr className="hover:bg-[#1a1a1a] transition-colors">
-                         <td className="p-4 text-[#00B4D8] font-bold">ACC_GHOST_88</td>
-                         <td className="p-4">Rs.3,50,00,000</td>
-                         <td className="p-4 text-xs text-gray-400">Premium decoy deployed</td>
-                         <td className="p-4 text-[10px] text-gray-600">Armed</td>
-                       </tr>
-                       <tr className="hover:bg-[#1a1a1a] transition-colors">
-                         <td className="p-4 text-[#00B4D8] font-bold">ACC_GHOST_33</td>
-                         <td className="p-4">Rs.1,00,000</td>
-                         <td className="p-4 text-xs text-gray-400">Micro-transaction trap</td>
-                         <td className="p-4 text-[10px] text-gray-600">Idle</td>
-                       </tr>
-                    </tbody>
-                  </table>
+              <div className="grid grid-cols-2 gap-6">
+                <div>
+                  <Section title="Honeypot Node Radar" t={t} />
+                  <Card t={t} className="flex flex-col items-center justify-center !py-12 relative overflow-hidden h-[400px]">
+                    <div className="absolute inset-0 opacity-10 pointer-events-none"
+                      style={{ background: 'linear-gradient(rgba(0, 255, 0, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 255, 0, 0.1) 1px, transparent 1px)', backgroundSize: '20px 20px' }}></div>
+                    <div className="relative flex items-center justify-center w-64 h-64 border border-[#333] rounded-full">
+                      <div className="absolute w-48 h-48 border border-[#333] rounded-full"></div>
+                      <div className="absolute w-32 h-32 border border-[#333] rounded-full"></div>
+                      <div className="absolute w-16 h-16 border border-[#333] rounded-full text-center flex items-center justify-center font-mono text-[8px] text-[#333]">CORE</div>
+                      <motion.div
+                        animate={{ rotate: 360 }}
+                        transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
+                        className="absolute w-full h-full rounded-full"
+                        style={{
+                          background: "conic-gradient(from 0deg, rgba(0, 230, 118, 0.05) 0deg, transparent 60deg, transparent 360deg)",
+                          borderRight: "1px solid rgba(0, 230, 118, 0.4)"
+                        }}
+                      />
+                      <motion.div animate={{ opacity: [0.1, 1, 0.1] }} transition={{ duration: 2, repeat: Infinity, delay: 0.2 }}
+                        className="absolute w-1.5 h-1.5 bg-[#00E676] rounded-full top-10 left-20 shadow-[0_0_8px_#00E676]" />
+                      <motion.div animate={{ opacity: [0.1, 1, 0.1] }} transition={{ duration: 2.5, repeat: Infinity, delay: 1 }}
+                        className="absolute w-2 h-2 bg-[#FFB300] rounded-full top-12 right-16 shadow-[0_0_10px_#FFB300]" />
+                      {honeypotBreaches.length > 0 ? (
+                        <motion.div animate={{ opacity: [0.1, 1, 0.1] }} transition={{ duration: 0.8, repeat: Infinity, delay: 0 }}
+                          className="absolute bottom-12 left-12 flex items-center gap-1.5">
+                          <div className="w-2.5 h-2.5 bg-[#E50914] rounded-full shadow-[0_0_12px_#E50914]" />
+                          <span className="text-[8px] font-mono font-bold text-[#E50914] tracking-widest whitespace-nowrap opacity-90 mix-blend-screen">[BREACH: {staticHoneypotBreach.accountId}]</span>
+                        </motion.div>
+                      ) : (
+                        <motion.div animate={{ opacity: [0.1, 1, 0.1] }} transition={{ duration: 3, repeat: Infinity, delay: 0.5 }}
+                          className="absolute bottom-12 left-12 flex items-center gap-1.5">
+                          <div className="w-2 h-2 bg-[#E50914] rounded-full shadow-[0_0_10px_#E50914]" />
+                          <span className="text-[8px] font-mono font-bold text-[#E50914] tracking-widest whitespace-nowrap opacity-80 mix-blend-screen">[TARGET PING: MUMBAI]</span>
+                        </motion.div>
+                      )}
+                      <motion.div animate={{ opacity: [0.1, 1, 0.1] }} transition={{ duration: 1.5, repeat: Infinity, delay: 2 }}
+                        className="absolute w-1.5 h-1.5 bg-[#00E676] rounded-full bottom-20 right-12 shadow-[0_0_8px_#00E676]" />
                     </div>
-                  </div>
-                </Card>
+                    <div className="mt-8 text-xs font-mono text-[#00E676] animate-pulse uppercase tracking-widest flex items-center gap-2">
+                      <span className="w-2 h-2 bg-[#00E676] rounded-sm"></span>
+                      {honeypotBreaches.length > 0 ? `${honeypotBreaches.length} Breach(es) Detected` : "Scanning Subnets..."}
+                    </div>
+                  </Card>
+                </div>
+
+                <div>
+                  <Section title="Active Ghost Accounts" t={t} />
+                  <Card t={t} className="!p-0 overflow-hidden">
+                    <div className="h-[400px] flex flex-col">
+                      <table className="w-full text-left text-sm font-mono flex-shrink-0">
+                        <thead className="bg-[#111] text-gray-500 text-[10px] uppercase sticky top-0 z-10">
+                          <tr>
+                            <th className="p-4 border-b border-[#222] w-1/4">Account ID</th>
+                            <th className="p-4 border-b border-[#222] w-1/4">Honey Balance</th>
+                            <th className="p-4 border-b border-[#222] w-1/4">Status</th>
+                            <th className="p-4 border-b border-[#222] w-1/4">Threat Origin</th>
+                          </tr>
+                        </thead>
+                      </table>
+                      <div className="overflow-y-auto flex-1">
+                        <table className="w-full text-left text-sm font-mono">
+                          <tbody className="divide-y divide-[#222]">
+                            {/* Live breach rows from real data */}
+                            {honeypotBreaches.slice(-5).reverse().map((tx, i) => (
+                              <tr key={tx.transaction_id || i} className="hover:bg-[#1a1a1a] transition-colors bg-[#2a1313]">
+                                <td className="p-4 text-[#E50914] font-bold">{tx.account_touched}</td>
+                                <td className="p-4">Rs.{(tx.amount || 0).toLocaleString()}</td>
+                                <td className="p-4 text-xs text-[#E50914] font-bold animate-pulse">
+                                  BREACH DETECTED
+                                  <button
+                                    onClick={() => { setProfileSearch(tx.emp_id); setPage("profile"); }}
+                                    className="ml-3 px-2 py-0.5 bg-[#E50914] text-white text-[9px] uppercase tracking-wider rounded font-bold hover:bg-red-700 transition cursor-pointer"
+                                  >[ Investigate ]</button>
+                                </td>
+                                <td className="p-4 text-[11px] text-[#FFB300] font-bold">{tx.emp_id} | {tx.branch_id || "Unknown Branch"}</td>
+                              </tr>
+                            ))}
+                            {/* Static monitored accounts */}
+                            <tr className="hover:bg-[#1a1a1a] transition-colors">
+                              <td className="p-4 text-[#00B4D8] font-bold">ACC-MIRAGE-001</td>
+                              <td className="p-4">Rs.50,00,000</td>
+                              <td className="p-4 text-xs text-gray-400">Monitoring for lookup</td>
+                              <td className="p-4 text-[10px] text-gray-600">-</td>
+                            </tr>
+                            <tr className="hover:bg-[#1a1a1a] transition-colors">
+                              <td className="p-4 text-[#00B4D8] font-bold">ACC-MIRAGE-002</td>
+                              <td className="p-4">Rs.1,20,00,000</td>
+                              <td className="p-4 text-xs text-gray-400">Decoy credential deployed</td>
+                              <td className="p-4 text-[10px] text-gray-600">Awaiting trace...</td>
+                            </tr>
+                            <tr className="hover:bg-[#1a1a1a] transition-colors">
+                              <td className="p-4 text-[#00B4D8] font-bold">ACC-MIRAGE-005</td>
+                              <td className="p-4">Rs.25,00,000</td>
+                              <td className="p-4 text-xs text-gray-400">Await access trigger</td>
+                              <td className="p-4 text-[10px] text-gray-600">Dormant</td>
+                            </tr>
+                            <tr className="hover:bg-[#1a1a1a] transition-colors">
+                              <td className="p-4 text-[#00B4D8] font-bold">ACC-MIRAGE-007</td>
+                              <td className="p-4">Rs.75,00,000</td>
+                              <td className="p-4 text-xs text-gray-400">Credential logged</td>
+                              <td className="p-4 text-[10px] text-gray-600">Monitoring</td>
+                            </tr>
+                            <tr className="hover:bg-[#1a1a1a] transition-colors">
+                              <td className="p-4 text-[#00B4D8] font-bold">ACC-MIRAGE-010</td>
+                              <td className="p-4">Rs.3,50,00,000</td>
+                              <td className="p-4 text-xs text-gray-400">Premium decoy deployed</td>
+                              <td className="p-4 text-[10px] text-gray-600">Armed</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </Card>
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* ── FOOTER TELEMETRY ──────────────────────────────── */}
         <div className="fixed bottom-0 left-60 right-0 border-t py-1.5 px-6 flex items-center justify-between z-50 text-[10px] font-mono tracking-widest" style={{ background: t.cardAlt, borderColor: t.border, color: t.text2 }}>
