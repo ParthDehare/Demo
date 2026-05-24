@@ -1,5 +1,6 @@
 # vaultmind_orchestrator.py
 import json
+import logging
 import math
 
 # ==========================================
@@ -14,6 +15,7 @@ from Agents.RegulatoryAI import RegulatoryAI
 from Agents.EvidenceBuilder import EvidenceBuilder
 from Agents.DeceptionGuard import DeceptionGuard
 from core.db_connections import supabase_db, redis_db
+
 class MasterOrchestrator:
     def __init__(self):
         print("[INIT] Initializing VaultMind Agents...")
@@ -35,7 +37,9 @@ class MasterOrchestrator:
         agent_scores = {}
         total_weight = 0.0
         weighted_sum = 0.0
-        employee_id = transaction.get("employee_id", "UNKNOWN")
+        
+        # FIXED: Priority check for 'emp_id' first, then 'employee_id'
+        employee_id = transaction.get("emp_id", transaction.get("employee_id", "UNKNOWN"))
         
         # ── 1. The Instant Kill-Switch (DeceptionGuard) ──
         # Honeypot logic has absolute priority.
@@ -76,6 +80,7 @@ class MasterOrchestrator:
                 return obj
                 
             return clean_nans(final_response)
+
         # ── 2. Run All Standard Agents ──
         # In a real cluster, this would run asynchronously
         results = {
@@ -171,26 +176,30 @@ class MasterOrchestrator:
             return obj
             
         return clean_nans(final_response)
+    
+    # Helper functions for database and cache operations
     def update_redis_cbsi(self, employee_id, cbsi_score):
         if redis_db is None:
-            # Agar Redis down hai ya setup nahi hai, toh error mat do, chup-chap nikal jao (Fallback)
+            # Fallback: If Redis is unavailable or unconfigured, log the warning and proceed without error.
+            print(f"⚠️ [Redis Warning] Connection not established. Skipping CBSI update for {employee_id}.")
             return
 
         try:
-            # "live_cbsi_scores" naam ke ek hi Hash/Folder mein saare employees ka score update hoga
+            # Update the score for the employee in the unified 'live_cbsi_scores' hash map
             redis_db.hset("live_cbsi_scores", str(employee_id), float(cbsi_score))
             print(f"⚡ [Redis Fast-Cache] Updated CBSI for {employee_id}: {cbsi_score}")
         except Exception as e:
-            print(f"⚠️ [Redis Update Error]: {e}")
+            logging.error(f"⚠️ [Redis Update Error]: Failed to update score. Details: {e}")
+        
     def save_evidence_to_db(self, transaction, cbsi_score, risk_level, evidence_path, agent_flags):
         if supabase_db is None:
             print("⚠️ [DB] Supabase not connected. Skipping DB insert.")
             return
 
-        # Supabase table (evidence_logs) ke hisaab se data pack kar rahe hain
+        # Prepare payload matching the Supabase 'evidence_logs' table schema
         data = {
             "transaction_id": str(transaction.get("transaction_id", "UNKNOWN")),
-            "employee_id": str(transaction.get("employee_id", "UNKNOWN")),
+            "employee_id": str(transaction.get("emp_id", transaction.get("employee_id", "UNKNOWN"))), 
             "cbsi_score": float(cbsi_score),
             "risk_level": str(risk_level),
             "evidence_path": str(evidence_path),
@@ -198,11 +207,11 @@ class MasterOrchestrator:
         }
         
         try:
-            # Data insert karne ka command
+            # Execute database insertion command
             response = supabase_db.table("evidence_logs").insert(data).execute()
-            print(f"✅ [Audit Log] Saved to Supabase DB: {data['transaction_id']}")
+            logging.info(f"✅ [Audit Log] Saved evidence to Supabase DB for TXN: {data['transaction_id']}")
         except Exception as e:
-            print(f"🔴 [DB Insert Error]: {e}")
+            logging.error(f"🔴 [DB Insert Error]: Failed to save to Supabase. Details: {e}")
 
 # Local Test
 if __name__ == "__main__":

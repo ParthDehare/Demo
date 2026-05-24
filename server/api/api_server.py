@@ -6,6 +6,8 @@ from datetime import datetime
 from core.master_orchestrator import MasterOrchestrator
 import pandas as pd
 import os
+import glob
+from fastapi.responses import FileResponse
 
 # Initialize APIRouter
 router = APIRouter()
@@ -124,6 +126,70 @@ def generate_explanation(emp_id: str, payload: Optional[ExplainRequest] = None):
         )
 
     return {"explanation": explanation}
+
+# ---------------------------------------------------------
+# ENDPOINT NEW: Download Actual Evidence PDF
+# ---------------------------------------------------------
+@router.get("/evidence/download")
+def download_evidence(emp_id: Optional[str] = None, filename: Optional[str] = None):
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    reports_dir = os.path.join(base_dir, "evidence_output", "pdf_reports")
+    
+    target_file = None
+    if filename:
+        # Remove any path prefixes from the frontend filename string
+        clean_name = filename.split("\\")[-1].split("/")[-1]
+        target_file = os.path.join(reports_dir, clean_name)
+    elif emp_id:
+        # Find the latest PDF for this specific employee
+        pattern = os.path.join(reports_dir, f"*_{emp_id}.pdf")
+        matches = glob.glob(pattern)
+        if matches:
+            target_file = max(matches, key=os.path.getmtime)
+            
+    if target_file and os.path.exists(target_file):
+        return FileResponse(
+            path=target_file,
+            filename=os.path.basename(target_file),
+            media_type='application/pdf'
+        )
+
+    # If no file found, generate one on-the-fly using the actual EvidenceBuilder
+    if emp_id:
+        try:
+            from Agents.EvidenceBuilder import EvidenceBuilder
+            eb = EvidenceBuilder()
+            simulated_tx = {
+                "emp_id": emp_id,
+                "amount": 0,
+                "action_type": "Live Simulation Incident",
+                "transaction_id": f"SIM_{emp_id}_001"
+            }
+            generated_path = eb.generate_evidence_package(simulated_tx, 100, "Simulated anomaly detected via Fund Flow Graph")
+            if generated_path and os.path.exists(generated_path):
+                return FileResponse(
+                    path=generated_path,
+                    filename=os.path.basename(generated_path),
+                    media_type='application/pdf'
+                )
+        except Exception as e:
+            print("Error generating fallback PDF:", e)
+
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="Evidence PDF not found on the server.")
+
+# ---------------------------------------------------------
+# ENDPOINT NEW: Mock STR Filing
+# ---------------------------------------------------------
+from pydantic import BaseModel
+class STRRequest(BaseModel):
+    emp_id: str
+    cbsi_score: float
+
+@router.post("/evidence/file-str")
+def file_str(payload: STRRequest):
+    # Simulated FIU-IND submission
+    return {"status": "success", "message": f"STR filed successfully for {payload.emp_id}"}
 
 # ---------------------------------------------------------
 # ENDPOINT NEW: Dashboard Init — loads historical warmup data

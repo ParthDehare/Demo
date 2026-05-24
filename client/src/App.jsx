@@ -15,124 +15,15 @@ import { getTriggeredRules, extractNlpFlags } from "./data";
 // ✨ Supabase Import Added Here ✨
 import { supabase } from './supabaseClient';
 
-// ─── Theme Tokens ────────────────────────────────────────────
-const DARK = {
-  bg: "#0a0a0a", card: "#121212", cardAlt: "#0f0f0f", border: "#222222",
-  text: "#FFFFFF", text2: "#A0A0A0", accent: "#E50914",
-  teal: "#00D4AA", cyan: "#00B4D8", red: "#E50914",
-  amber: "#FFB300", green: "#00E676",
-};
-const LIGHT = {
-  bg: "#F5F5F5", card: "#FFFFFF", cardAlt: "#F8F9FA", border: "#E0E0E0",
-  text: "#1A1A1A", text2: "#666", accent: "#D32F2F",
-  teal: "#00897B", cyan: "#0288D1", red: "#D32F2F",
-  amber: "#F57F17", green: "#2E7D32",
-};
-
-const TIER_COLORS = (t) => ({
-  CRITICAL: t.red, HIGH: t.amber, WATCH: t.cyan, NORMAL: t.green,
-});
-
-const ROWS_PER_PAGE = 20;
-
-const riskTier = (score) => {
-  if (score >= 70) return "CRITICAL";
-  if (score >= 50) return "HIGH";
-  if (score >= 30) return "WATCH";
-  return "NORMAL";
-};
-
-// ─── Badge Component ─────────────────────────────────────────
-function Badge({ tier, t }) {
-  const colors = TIER_COLORS(t);
-  const c = colors[tier] || t.text2;
-  return (
-    <span
-      className="px-2.5 py-0.5 rounded-sm text-xs font-mono font-semibold border"
-      style={{ color: c, borderColor: c, background: `${c}22` }}
-    >
-      {tier}
-    </span>
-  );
-}
-
-// ─── Card Component ──────────────────────────────────────────
-function Card({ children, t, className = "", style = {}, ...props }) {
-  return (
-    <div
-      className={`rounded-sm border p-5 transition-colors duration-200 ${className}`}
-      style={{
-        background: t.card, borderColor: t.border,
-        boxShadow: "0 0 10px rgba(0,0,0,0.4)",
-        ...style,
-      }}
-      {...props}
-    >
-      {children}
-    </div>
-  );
-}
-
-// ─── KPI Card ────────────────────────────────────────────────
-function KpiCard({ title, value, color, t }) {
-  return (
-    <Card t={t}>
-      <div className="text-[11px] font-semibold uppercase tracking-widest mb-1" style={{ color: t.text2 }}>
-        {title}
-      </div>
-      <div className="text-3xl font-bold font-mono" style={{ color }}>{value}</div>
-    </Card>
-  );
-}
-
-// ─── Section Header ──────────────────────────────────────────
-function Section({ title, t }) {
-  return (
-    <div
-      className="text-[13px] font-bold uppercase tracking-[2px] py-2.5 border-b mb-4"
-      style={{ color: t.text2, borderColor: t.border }}
-    >
-      {title}
-    </div>
-  );
-}
-
-function LoadingShimmer({ t }) {
-  return (
-    <div className="space-y-4">
-      {Array(5).fill(0).map((_, i) => (
-        <div
-          key={i}
-          className="h-16 rounded-sm animate-pulse"
-          style={{ background: `${t.border}44` }}
-        />
-      ))}
-    </div>
-  );
-}
-
-function GraphSkeleton({ t, height = 300 }) {
-  return (
-    <div
-      className="w-full rounded-lg animate-pulse overflow-hidden"
-      style={{ height, background: `${t.border}33` }}
-    >
-      <div className="h-full w-full flex items-end gap-3 p-6">
-        {Array(8).fill(0).map((_, i) => (
-          <div
-            key={i}
-            className="rounded-sm"
-            style={{
-              width: "12%",
-              height: `${30 + i * 8}px`,
-              background: `${t.border}66`
-            }}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
+import { DARK, LIGHT, TIER_COLORS, ROWS_PER_PAGE, riskTier } from "./utils.js";
+import { Badge } from "./components/Badge.jsx";
+import { Card } from "./components/Card.jsx";
+import { KpiCard } from "./components/KpiCard.jsx";
+import { Section } from "./components/Section.jsx";
+import { LoadingShimmer } from "./components/LoadingShimmer.jsx";
+import { GraphSkeleton } from "./components/GraphSkeleton.jsx";
+import { EnforcementMatrix } from "./components/EnforcementMatrix.jsx";
+import { ProfileTabs } from "./components/ProfileTabs.jsx";
 
 export default function App() {
   const [theme, setTheme] = useState("dark");
@@ -1060,7 +951,29 @@ export default function App() {
                             <span className="text-xs text-[#FFB300] font-bold animate-pulse">PENDING DOSSIER</span>
                           ) : (
                             <button
-                              onClick={() => { setDownloading(evd.filename); setTimeout(() => setDownloading(null), 2000); }}
+                              onClick={async () => {
+                                setDownloading(evd.filename);
+                                try {
+                                  const cleanFilename = evd.filename.split('\\').pop().split('/').pop();
+                                  const response = await fetch(`http://localhost:8000/api/evidence/download?filename=${encodeURIComponent(cleanFilename)}`);
+                                  if (response.ok) {
+                                    const blob = await response.blob();
+                                    const url = window.URL.createObjectURL(blob);
+                                    const a = document.createElement('a');
+                                    a.href = url;
+                                    a.download = cleanFilename;
+                                    document.body.appendChild(a);
+                                    a.click();
+                                    a.remove();
+                                    window.URL.revokeObjectURL(url);
+                                  } else {
+                                    alert("Evidence PDF not found on server.");
+                                  }
+                                } catch(e) {
+                                  console.error("Download error:", e);
+                                }
+                                setDownloading(null);
+                              }}
                               className="flex items-center gap-2 px-3 py-1.5 rounded bg-[#E50914] text-white text-[10px] uppercase font-bold hover:bg-red-700 transition cursor-pointer"
                               disabled={downloading === evd.filename}
                             >
@@ -1305,178 +1218,4 @@ export default function App() {
     </div>
   );
 }
-
-// ─── Enforcement Matrix Component ──────────────────────────────
-function EnforcementMatrix({ emp_id, onConfirm }) {
-  const [status, setStatus] = useState("idle");
-
-  if (status === "done") {
-    return <div className="mt-3 text-[10px] font-mono text-[#00E676] font-bold">STATUS: RESOLVED</div>;
-  }
-
-  if (status === "recalibrating") {
-    return (
-      <div className="mt-3 text-[10px] font-mono text-[#FFB300] flex items-center gap-2">
-        <Loader2 size={12} className="animate-spin" /> RECALIBRATING ISOLATION FOREST THRESHOLDS...
-      </div>
-    );
-  }
-
-  const handleAction = async (actionType) => {
-    if (actionType === "FALSE_ALARM") setStatus("recalibrating");
-    try {
-      await fetch(`http://localhost:8000/api/feedback/${emp_id}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: actionType })
-      });
-    } catch (e) { console.error("Feedback error", e); }
-    
-    if (actionType === "CONFIRM") {
-      setStatus("done");
-      if (onConfirm) onConfirm(emp_id);
-    } else {
-      setTimeout(() => setStatus("done"), 2000);
-    }
-  };
-
-  return (
-    <div className="mt-3 flex items-center gap-2 pt-2 border-t border-[#222]">
-      <button 
-        onClick={(e) => { e.stopPropagation(); handleAction("CONFIRM"); }}
-        className="px-2 py-1 text-[9px] font-mono font-bold border border-[#E50914] text-[#E50914] hover:bg-[#E50914] hover:text-white transition-colors uppercase rounded-sm cursor-pointer"
-      >
-        [ Confirm Incident ]
-      </button>
-      <button 
-        onClick={(e) => { e.stopPropagation(); handleAction("FALSE_ALARM"); }}
-        className="px-2 py-1 text-[9px] font-mono font-bold border border-gray-600 text-gray-500 hover:border-[#FFB300] hover:bg-[#FFB300] hover:text-[#0a0a0a] transition-colors uppercase rounded-sm cursor-pointer"
-      >
-        [ False Alarm / Retrain ]
-      </button>
-    </div>
-  );
-}
-
-// ─── Profile Tabs Sub-Component ──────────────────────────────
-function ProfileTabs({ t, tc, trendData, txns, flaggedTxns, nlpTxns, eid, isCritical, isCalm }) {
-  const [tab, setTab] = useState("trend");
-  const tabs = [
-    { id: "trend", label: "Risk Trend" },
-    { id: "txns", label: "Transactions" },
-    { id: "rules", label: "Triggered Rules" },
-    { id: "nlp", label: "NLP Flags" },
-  ];
-
-  const chartColor = isCritical ? t.red : isCalm ? t.teal : t.accent;
-
-  return (
-    <div>
-      <div className="flex border-b mb-4" style={{ borderColor: t.border }}>
-        {tabs.map(({ id, label }) => (
-          <button key={id} onClick={() => setTab(id)}
-            className="px-5 py-2.5 text-sm font-semibold transition-colors cursor-pointer"
-            style={{
-              color: tab === id ? chartColor : t.text2,
-              borderBottom: tab === id ? `2px solid ${chartColor}` : "2px solid transparent",
-            }}
-          >{label}</button>
-        ))}
-      </div>
-
-      {tab === "trend" && (
-        <Card t={t}>
-          <Section title={`Historical Risk Trend - ${eid}`} t={t} />
-          {trendData.length ? (
-            <ResponsiveContainer width="100%" height={320}>
-              <AreaChart data={trendData}>
-                <defs>
-                  <linearGradient id="profileStroke" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="25%" stopColor="#ef4444" />
-                    <stop offset="25%" stopColor="#00B4D8" />
-                    <stop offset="100%" stopColor="#00B4D8" />
-                  </linearGradient>
-                  <linearGradient id="profileFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="25%" stopColor="#ef4444" stopOpacity={0.35} />
-                    <stop offset="25%" stopColor="#00B4D8" stopOpacity={0.2} />
-                    <stop offset="100%" stopColor="#00B4D8" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 6" stroke={t.border} opacity={0.25} />
-                <XAxis dataKey="date" tick={{ fill: t.text2, fontSize: 10 }} tickFormatter={(v) => v.slice(5)} />
-                <YAxis tick={{ fill: t.text2, fontSize: 10 }} domain={[0, 100]} />
-                <Tooltip contentStyle={{ background: t.card, border: `1px solid ${t.border}`, color: t.text, borderRadius: 8 }} />
-                <Area type="monotone" dataKey="cbsi" stroke="url(#profileStroke)" strokeWidth={2} fill="url(#profileFill)" dot={false} />
-              </AreaChart>
-            </ResponsiveContainer>
-          ) : <div className="text-sm py-8 text-center" style={{ color: t.text2 }}>Not enough data</div>}
-        </Card>
-      )}
-
-      {tab === "txns" && (
-        <Card t={t} className="!p-0 overflow-hidden">
-          <table className="w-full text-sm">
-            <thead><tr style={{ background: t.cardAlt }}>
-              {["Timestamp", "Action", "Amount", "Channel", "Account", "CBSI", "Fraud"].map((h) => (
-                <th key={h} className="px-3 py-2 text-left text-[11px] uppercase tracking-wider" style={{ color: t.text2 }}>{h}</th>
-              ))}
-            </tr></thead>
-            <tbody>
-              {txns.slice(-50).reverse().map((tx, i) => (
-                <tr key={i} className="border-t" style={{ borderColor: t.border }}>
-                  <td className="px-3 py-2 text-xs" style={{ color: t.text2 }}>{tx?.timestamp?.slice(0, 19)}</td>
-                  <td className="px-3 py-2 text-xs">{tx?.action_type}</td>
-                  <td className="px-3 py-2 text-xs font-mono">Rs.{(tx?.amount || 0).toLocaleString()}</td>
-                  <td className="px-3 py-2 text-xs" style={{ color: t.text2 }}>{tx?.transfer_channel}</td>
-                  <td className="px-3 py-2 text-xs font-mono" style={{ color: t.text2 }}>{tx?.account_touched}</td>
-                  <td className="px-3 py-2 font-mono font-bold" style={{ color: tc[riskTier(tx.cbsi)] }}>{tx.cbsi}</td>
-                  <td className="px-3 py-2">{tx?.is_fraud_flag ? <span style={{ color: t.red }}>YES</span> : <span style={{ color: t.green }}>NO</span>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </Card>
-      )}
-
-      {tab === "rules" && (
-        <div className="space-y-2">
-          {flaggedTxns.length ? flaggedTxns.map((tx, i) => {
-            const rules = getTriggeredRules(tx);
-            if (!rules.length) return null;
-            return rules.map((r, j) => (
-              <Card key={`${i}-${j}`} t={t} style={{ borderLeft: `3px solid ${t.amber}` }} className="!py-2.5 !px-4">
-                <div className="flex justify-between">
-                  <span className="text-xs font-semibold" style={{ color: t.amber }}>{r}</span>
-                  <span className="text-[11px]" style={{ color: t.text2 }}>{tx?.timestamp?.slice(0, 19)}</span>
-                </div>
-              </Card>
-            ));
-          }) : <div className="text-sm py-8 text-center" style={{ color: t.text2 }}>No rule triggers</div>}
-        </div>
-      )}
-
-      {tab === "nlp" && (
-        <div className="space-y-2">
-          {nlpTxns.length ? nlpTxns.slice(0, 15).map((tx, i) => {
-            const flags = extractNlpFlags(tx);
-            return (
-              <div key={i}>
-                {flags.map((f, j) => (
-                  <Card key={j} t={t} style={{ borderLeft: `3px solid ${t.red}` }} className="!py-2.5 !px-4 mb-1">
-                    <div className="flex justify-between">
-                      <span className="text-xs font-semibold" style={{ color: t.red }}>NLP MATCH: {f}</span>
-                      <span className="text-[11px]" style={{ color: t.text2 }}>{tx?.timestamp?.slice(0, 19)}</span>
-                    </div>
-                  </Card>
-                ))}
-                <div className="text-[11px] px-4 mb-2" style={{ color: t.text2 }}>
-                  Text: <em>{tx?.raw_complaint_text?.slice(0, 200)}</em>
-                </div>
-              </div>
-            );
-          }) : <div className="text-sm py-8 text-center" style={{ color: t.text2 }}>No NLP-relevant text found</div>}
-        </div>
-      )}
-    </div>
-  );
-}
+

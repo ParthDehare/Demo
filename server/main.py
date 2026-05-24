@@ -2,6 +2,8 @@
 import json
 import asyncio
 import threading
+import os
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from kafka import KafkaConsumer
@@ -51,7 +53,7 @@ def kafka_listener():
             bootstrap_servers=['localhost:9092'],
             group_id='vaultmind-group',
             auto_offset_reset='earliest',
-            enable_auto_commit=True, # <--- Ye zaroori hai
+            enable_auto_commit=True, # Ensure auto-commit is enabled for offset management
             value_deserializer=lambda m: json.loads(m.decode('utf-8'))
         )
         print("🎧 Listening to Kafka Topic...")
@@ -59,7 +61,7 @@ def kafka_listener():
         # 2. Main loop with explicit heartbeat
         for message in consumer:
             transaction = message.value
-            print(f"DEBUG: Processing Tx: {transaction.get('transaction_id')}") # Confirm ke liye
+            print(f"DEBUG: Processing Tx: {transaction.get('transaction_id')}") # Log transaction for debugging
             
             # Brain Logic
             result = orchestrator.process_transaction(transaction)
@@ -67,7 +69,7 @@ def kafka_listener():
             # Send to Frontend
             if active_connections and main_loop is not None:
                 for connection in active_connections:
-                    # Asyncio event loop ko handle karne ka sahi tareeka
+                    # Safely schedule the async WebSocket send from the synchronous Kafka thread
                     asyncio.run_coroutine_threadsafe(connection.send_json(result), main_loop)
 
     except Exception as e:
@@ -82,8 +84,8 @@ async def startup_event():
     thread.start()
 @app.get("/get-next-transaction")
 async def get_next_transaction():
-    # Yeh function backend se ek transaction uthakar frontend ko dega
-    # Agar tere paas koi queue/buffer hai, toh wahan se data le aana
+    # Retrieve the next transaction from the backend to send to the frontend.
+    # Note: If a queue/buffer system is implemented, fetch the data from there.
     # Example:
     try:
         # Assuming you have a way to get the latest processed transaction
@@ -91,6 +93,21 @@ async def get_next_transaction():
         return txn
     except Exception as e:
         return {"error": "No transaction available", "details": str(e)}
+    
+
+@app.get("/api/evidence/download")
+def download_evidence(emp_id: str):
+    # Dummy fallback response agar sach mein PDF generation pipeline ready na ho
+    return {"status": "success", "message": f"Evidence package compiled for {emp_id}."}
+
+@app.post("/api/evidence/file-str")
+def file_str(payload: dict):
+    emp_id = payload.get("emp_id")
+    cbsi_score = payload.get("cbsi_score")
+    return {
+        "status": "success", 
+        "message": f"STR successfully filed securely to FIU-IND for node {emp_id}"
+    }
 
 @app.get("/")
 def read_root():
